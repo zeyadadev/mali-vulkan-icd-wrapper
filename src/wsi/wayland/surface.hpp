@@ -38,6 +38,9 @@
 #include "wl_object_owner.hpp"
 #include "../layer_utils/macros.hpp"
 
+// Forward declarations for SDL types
+struct SDL_Window;
+
 namespace wsi
 {
 namespace wayland
@@ -71,6 +74,18 @@ public:
    static util::unique_ptr<surface> make_surface(const util::allocator &allocator, wl_display *display,
                                                  wl_surface *surf);
 
+   /**
+    * @brief Allocates and initializes a surface with external (SDL-owned) Wayland objects
+    *
+    * @param allocator An allocator to use for host allocations needed for the surface.
+    * @param display   The external Wayland display (owned by SDL)
+    * @param surf      The external Wayland surface (owned by SDL)
+    *
+    * @return A constructed and initialized surface or nullptr on failure
+    */
+   static util::unique_ptr<surface> make_surface_external(const util::allocator &allocator, wl_display *display,
+                                                          wl_surface *surf, SDL_Window *sdl_window = nullptr);
+
    /** Destructor */
    ~surface() override;
 
@@ -89,6 +104,11 @@ public:
    {
       return wayland_surface;
    }
+
+   /**
+    * @brief Handle SDL events if this surface has an associated SDL window
+    */
+   void handle_sdl_events();
 
    /**
     * @brief Returns a pointer to the Wayland zwp_linux_dmabuf_v1 interface.
@@ -161,6 +181,12 @@ private:
 
    /** The native Wayland surface */
    wl_surface *wayland_surface;
+
+   /** True if the Wayland surface and display are externally owned (e.g. by SDL) */
+   bool m_external_ownership;
+
+   /** SDL window associated with this surface (when externally owned) */
+   SDL_Window *m_sdl_window;
    /** A list of DRM formats supported by the Wayland compositor on this surface */
    util::vector<drm_format_pair> supported_formats;
    /** Surface properties specific to the Wayland surface. */

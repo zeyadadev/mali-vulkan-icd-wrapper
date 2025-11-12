@@ -539,6 +539,10 @@ void swapchain::present_image(const pending_present_request &pending_present)
    wayland_image_data *image_data =
       reinterpret_cast<wayland_image_data *>(m_swapchain_images[pending_present.image_index].data);
 
+   // Handle SDL events if this surface has an associated SDL window
+   // This keeps the window responsive and processes controller input
+   m_wsi_surface->handle_sdl_events();
+
    /* if a frame is already pending, wait for a hint to present again */
    if (!m_wsi_surface->wait_next_frame_event())
    {

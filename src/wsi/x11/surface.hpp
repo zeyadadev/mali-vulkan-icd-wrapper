@@ -34,6 +34,11 @@
 #include "wsi/surface.hpp"
 #include "surface_properties.hpp"
 
+#if BUILD_WSI_WAYLAND
+namespace wsi { namespace wayland { class surface; }}
+namespace wsi { namespace x11 { class EventBridge; }}
+#endif
+
 namespace wsi
 {
 namespace x11
@@ -79,6 +84,30 @@ public:
    }
 
 private:
+#if BUILD_WSI_WAYLAND
+   /**
+    * @brief Check if we should route to Wayland swapchain via SDL
+    *
+    * @return true if SDL is active with Wayland driver, false otherwise
+    */
+   bool should_use_wayland_via_sdl() const;
+
+   /**
+    * @brief Create Wayland swapchain using SDL-extracted surface
+    *
+    * @param dev_data Device private data
+    * @param allocator Vulkan allocator callbacks
+    * @param alloc Utility allocator
+    * @return Wayland swapchain instance or nullptr on failure
+    */
+   util::unique_ptr<swapchain_base> create_wayland_swapchain_via_sdl(wsi::device_private_data &dev_data,
+                                                                     const VkAllocationCallbacks *allocator,
+                                                                     util::allocator &alloc);
+
+   mutable util::unique_ptr<wayland::surface> m_sdl_wayland_surface;
+   mutable std::unique_ptr<wsi::x11::EventBridge> m_event_bridge;
+#endif
+
    xcb_connection_t *m_connection;
    xcb_window_t m_window;
    /** Surface properties specific to the X11 surface. */

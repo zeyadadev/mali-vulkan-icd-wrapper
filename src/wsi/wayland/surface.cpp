@@ -33,6 +33,10 @@
 #include "wl_helpers.hpp"
 #include "utils/logging.hpp"
 
+extern "C" {
+#include <SDL2/SDL.h>
+}
+
 namespace wsi
 {
 namespace wayland
@@ -127,6 +131,8 @@ struct surface::init_parameters
    const util::allocator &allocator;
    wl_display *display;
    wl_surface *surf;
+   bool external_ownership = false;
+   SDL_Window *sdl_window = nullptr;
 };
 
 surface::surface(const init_parameters &params)
@@ -134,6 +140,8 @@ surface::surface(const init_parameters &params)
    , wayland_display(params.display)
    , surface_queue(nullptr)
    , wayland_surface(params.surf)
+   , m_external_ownership(params.external_ownership)
+   , m_sdl_window(params.sdl_window)
    , supported_formats(params.allocator)
    , properties(this, params.allocator)
    , last_frame_callback(nullptr)
@@ -276,8 +284,29 @@ util::unique_ptr<surface> surface::make_surface(const util::allocator &allocator
    return nullptr;
 }
 
+util::unique_ptr<surface> surface::make_surface_external(const util::allocator &allocator, wl_display *display, wl_surface *surf, SDL_Window *sdl_window)
+{
+   init_parameters params{ allocator, display, surf, true /* external_ownership */, sdl_window };
+   auto wsi_surface = allocator.make_unique<surface>(params);
+   if (wsi_surface != nullptr)
+   {
+      if (wsi_surface->init())
+      {
+         WSI_LOG_INFO("Successfully created Wayland surface with external ownership (SDL window: %p)", sdl_window);
+         return wsi_surface;
+      }
+   }
+   return nullptr;
+}
+
 surface::~surface()
 {
+   if (m_external_ownership && m_sdl_window)
+   {
+      WSI_LOG_INFO("Destroying SDL window associated with external Wayland surface");
+      SDL_DestroyWindow(m_sdl_window);
+      m_sdl_window = nullptr;
+   }
 }
 
 wsi::surface_properties &surface::get_properties()
@@ -359,6 +388,17 @@ bool surface::wait_next_frame_event()
    }
 
    return true;
+}
+
+void surface::handle_sdl_events()
+{
+   if (!m_external_ownership || !m_sdl_window)
+   {
+      return;
+   }
+
+   // Don't poll events to avoid interfering with application input handling
+   SDL_PumpEvents();
 }
 
 } // namespace wayland

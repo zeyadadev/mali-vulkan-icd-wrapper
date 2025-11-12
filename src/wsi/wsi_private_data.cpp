@@ -466,8 +466,7 @@ bool instance_private_data::does_layer_support_surface(VkSurfaceKHR surface)
    scoped_mutex lock(surfaces_lock);
    auto it = surfaces.find(surface);
    bool found = it != surfaces.end();
-   WSI_LOG_DEBUG("does_layer_support_surface: surface=%p found=%s (surfaces_count=%zu)",
-                 (void*)surface, found ? "true" : "false", surfaces.size());
+   
    return found;
 }
 
@@ -499,9 +498,7 @@ bool instance_private_data::should_layer_handle_surface(VkPhysicalDevice phys_de
    bool icd_can_handle_surface = do_icds_support_surface(phys_dev, surface);
    bool layer_can_handle_surface = does_layer_support_surface(surface);
    bool ret = layer_can_handle_surface && !icd_can_handle_surface;
-   WSI_LOG_DEBUG("should_layer_handle_surface: surface=%p icd_can=%s layer_can=%s result=%s",
-                 (void*)surface, icd_can_handle_surface ? "true" : "false",
-                 layer_can_handle_surface ? "true" : "false", ret ? "true" : "false");
+
    return ret;
 }
 

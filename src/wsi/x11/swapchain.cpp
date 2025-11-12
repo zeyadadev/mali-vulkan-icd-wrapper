@@ -506,7 +506,7 @@ void swapchain::present_image(const pending_present_request &pending_present)
    VkResult present_result = m_shm_presenter->present_image(image_data, serial);
    if (present_result != VK_SUCCESS)
    {
-      WSI_LOG_ERROR("Failed to present image using presentation strategy: %d", present_result);
+      WSI_LOG_ERROR("Failed to present image using SHM presenter: %d", present_result);
    }
 
    if (m_device_data.is_present_id_enabled())

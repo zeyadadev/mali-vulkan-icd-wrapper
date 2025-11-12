@@ -44,6 +44,7 @@ pkg_check_modules(VULKAN REQUIRED vulkan)
 # WSI dependencies
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
+pkg_check_modules(SDL2 REQUIRED sdl2)
 find_package(X11 REQUIRED)
 
 # Find XCB
@@ -104,6 +105,8 @@ set(WSI_X11_SOURCES
     src/wsi/x11/swapchain.cpp
     src/wsi/x11/shm_presenter.cpp
     src/wsi/x11/drm_display.cpp
+    src/wsi/x11/sdl_wayland_swapchain_wrapper.cpp
+    src/wsi/x11/event_bridge.cpp
 )
 
 # Platform-specific WSI sources (Wayland)
@@ -177,6 +180,7 @@ endif()
 
 if(BUILD_WSI_WAYLAND)
     set(BUILD_WSI_WAYLAND_DEFINE 1)
+    set(ENABLE_WAYLAND_FIFO_PRESENTATION_THREAD_DEFINE 1)
 endif()
 
 if(BUILD_WSI_HEADLESS)
@@ -197,6 +201,7 @@ set(COMMON_INCLUDES
     ${VULKAN_INCLUDE_DIRS}
     ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${LIBDRM_INCLUDE_DIRS}
+    ${SDL2_INCLUDE_DIRS}
     ${X11_INCLUDE_DIR}
     ${XCB_INCLUDE_DIRS}
     /usr/include
@@ -224,6 +229,7 @@ set(COMMON_LIBRARIES
     ${CMAKE_DL_LIBS}
     ${WAYLAND_CLIENT_LIBRARIES}
     ${LIBDRM_LIBRARIES}
+    ${SDL2_LIBRARIES}
     ${X11_LIBRARIES}
     ${X11_Xrandr_LIB}
     ${XCB_LIBRARIES}
