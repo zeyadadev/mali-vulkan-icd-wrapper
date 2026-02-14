@@ -20,6 +20,15 @@
 #include <string>
 #include <chrono>
 #include <mutex>
+#include <limits>
+#include <cstdint>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cerrno>
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
 namespace mali_wrapper {
 
@@ -36,6 +45,220 @@ static std::unordered_map<VkInstance, std::unique_ptr<InstanceInfo>> managed_ins
 static std::unordered_map<VkDevice, VkInstance> managed_devices;
 static std::mutex instance_mutex;
 static VkInstance latest_instance = VK_NULL_HANDLE;
+
+struct DeviceMemoryKey {
+    VkDevice device;
+    VkDeviceMemory memory;
+
+    bool operator==(const DeviceMemoryKey& other) const {
+        return device == other.device && memory == other.memory;
+    }
+};
+
+struct DeviceMemoryKeyHash {
+    size_t operator()(const DeviceMemoryKey& key) const noexcept {
+        const auto device_hash = std::hash<void*>{}(reinterpret_cast<void*>(key.device));
+        const auto memory_hash = std::hash<void*>{}(reinterpret_cast<void*>(key.memory));
+        return device_hash ^ (memory_hash << 1);
+    }
+};
+
+struct ShadowMappingInfo {
+    void* real_ptr = nullptr;
+    void* shadow_ptr = nullptr;
+    size_t shadow_size = 0;
+    VkDeviceSize offset = 0;
+    VkDeviceSize mapped_size = 0;
+};
+
+static std::mutex memory_tracking_mutex;
+static std::unordered_map<DeviceMemoryKey, VkDeviceSize, DeviceMemoryKeyHash> tracked_memory_allocations;
+static std::unordered_map<DeviceMemoryKey, ShadowMappingInfo, DeviceMemoryKeyHash> shadow_mappings;
+
+static constexpr uintptr_t kMax32BitAddressExclusive = 0x100000000ULL;
+static constexpr uintptr_t kShadowSearchStart = 0x10000000ULL;
+static constexpr uintptr_t kShadowSearchEnd = 0xF0000000ULL;
+static constexpr uintptr_t kShadowSearchStep = 0x00100000ULL;
+
+static DeviceMemoryKey make_memory_key(VkDevice device, VkDeviceMemory memory)
+{
+    return DeviceMemoryKey{ device, memory };
+}
+
+static bool is_bool_env_enabled(const char* name, bool default_value)
+{
+    const char* value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    if (value[0] == '0' || value[0] == 'n' || value[0] == 'N' ||
+        value[0] == 'f' || value[0] == 'F') {
+        return false;
+    }
+    return true;
+}
+
+static bool should_use_low_address_shadow_map()
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached == 1;
+    }
+
+    const bool forced = getenv("MALI_WRAPPER_LOW_ADDRESS_MAP") != nullptr;
+    if (forced) {
+        cached = is_bool_env_enabled("MALI_WRAPPER_LOW_ADDRESS_MAP", false) ? 1 : 0;
+        return cached == 1;
+    }
+
+    const bool auto_enable = getenv("WINEWOW64") != nullptr || getenv("WINE_WOW64") != nullptr;
+    cached = auto_enable ? 1 : 0;
+    return cached == 1;
+}
+
+static bool is_pointer_32bit_compatible(const void* ptr)
+{
+    return reinterpret_cast<uintptr_t>(ptr) < kMax32BitAddressExclusive;
+}
+
+static bool resolve_map_size_locked(const DeviceMemoryKey& key, VkDeviceSize offset,
+                                    VkDeviceSize requested_size, VkDeviceSize* out_size)
+{
+    if (out_size == nullptr) {
+        return false;
+    }
+
+    if (requested_size != VK_WHOLE_SIZE) {
+        *out_size = requested_size;
+        return requested_size > 0;
+    }
+
+    auto alloc_it = tracked_memory_allocations.find(key);
+    if (alloc_it == tracked_memory_allocations.end()) {
+        return false;
+    }
+
+    const VkDeviceSize allocation_size = alloc_it->second;
+    if (offset >= allocation_size) {
+        return false;
+    }
+
+    *out_size = allocation_size - offset;
+    return *out_size > 0;
+}
+
+static bool compute_copy_region(const ShadowMappingInfo& mapping, VkDeviceSize range_offset,
+                                VkDeviceSize range_size, size_t* out_offset, size_t* out_size)
+{
+    if (mapping.shadow_ptr == nullptr || mapping.real_ptr == nullptr || mapping.mapped_size == 0) {
+        return false;
+    }
+
+    if (range_offset < mapping.offset) {
+        return false;
+    }
+
+    const VkDeviceSize local_offset = range_offset - mapping.offset;
+    if (local_offset >= mapping.mapped_size) {
+        return false;
+    }
+
+    VkDeviceSize copy_size = (range_size == VK_WHOLE_SIZE) ? (mapping.mapped_size - local_offset) : range_size;
+    const VkDeviceSize max_size = mapping.mapped_size - local_offset;
+    if (copy_size > max_size) {
+        copy_size = max_size;
+    }
+
+    if (copy_size == 0 ||
+        local_offset > static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max()) ||
+        copy_size > static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+
+    *out_offset = static_cast<size_t>(local_offset);
+    *out_size = static_cast<size_t>(copy_size);
+    return true;
+}
+
+static void* allocate_low_address_shadow(size_t requested_size, size_t* out_shadow_size)
+{
+    if (out_shadow_size == nullptr || requested_size == 0) {
+        return nullptr;
+    }
+
+    long page_size_value = sysconf(_SC_PAGESIZE);
+    if (page_size_value <= 0) {
+        page_size_value = 4096;
+    }
+
+    const size_t page_size = static_cast<size_t>(page_size_value);
+    const size_t aligned_size = ((requested_size + page_size - 1) / page_size) * page_size;
+    if (aligned_size == 0 || aligned_size < requested_size) {
+        return nullptr;
+    }
+
+#ifdef MAP_32BIT
+    void* mapped = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    if (mapped != MAP_FAILED) {
+        const uintptr_t mapped_addr = reinterpret_cast<uintptr_t>(mapped);
+        if (mapped_addr + aligned_size <= kMax32BitAddressExclusive) {
+            *out_shadow_size = aligned_size;
+            return mapped;
+        }
+        munmap(mapped, aligned_size);
+    }
+#endif
+
+    for (uintptr_t addr = kShadowSearchStart;
+         addr < kShadowSearchEnd && addr + aligned_size < kMax32BitAddressExclusive;
+         addr += kShadowSearchStep) {
+        void* mapped = mmap(reinterpret_cast<void*>(addr), aligned_size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (mapped != MAP_FAILED) {
+            *out_shadow_size = aligned_size;
+            return mapped;
+        }
+
+        if (errno != EEXIST && errno != EINVAL && errno != ENOMEM && errno != EBUSY) {
+            break;
+        }
+    }
+
+    return nullptr;
+}
+
+static void remove_tracking_for_device(VkDevice device)
+{
+    std::vector<ShadowMappingInfo> stale_mappings;
+
+    {
+        std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+        for (auto it = shadow_mappings.begin(); it != shadow_mappings.end(); ) {
+            if (it->first.device == device) {
+                stale_mappings.push_back(it->second);
+                it = shadow_mappings.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        for (auto it = tracked_memory_allocations.begin(); it != tracked_memory_allocations.end(); ) {
+            if (it->first.device == device) {
+                it = tracked_memory_allocations.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (const auto& mapping : stale_mappings) {
+        if (mapping.shadow_ptr != nullptr && mapping.shadow_size > 0) {
+            munmap(mapping.shadow_ptr, mapping.shadow_size);
+        }
+    }
+}
 
 void add_instance_reference(VkInstance instance) {
     std::lock_guard<std::mutex> lock(instance_mutex);
@@ -96,6 +319,16 @@ static VkInstance get_device_parent_instance(VkDevice device)
     }
 
     return VK_NULL_HANDLE;
+}
+
+static VkDevice get_any_managed_device()
+{
+    std::lock_guard<std::mutex> lock(instance_mutex);
+    if (managed_devices.empty()) {
+        return VK_NULL_HANDLE;
+    }
+
+    return managed_devices.begin()->first;
 }
 
 
@@ -186,6 +419,62 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice);
 static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator);
 static VKAPI_ATTR VkResult VKAPI_CALL mali_driver_create_device(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkAllocateMemory(
+    VkDevice device,
+    const VkMemoryAllocateInfo* pAllocateInfo,
+    const VkAllocationCallbacks* pAllocator,
+    VkDeviceMemory* pMemory);
+static VKAPI_ATTR void VKAPI_CALL internal_vkFreeMemory(
+    VkDevice device,
+    VkDeviceMemory memory,
+    const VkAllocationCallbacks* pAllocator);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory(
+    VkDevice device,
+    VkDeviceMemory memory,
+    VkDeviceSize offset,
+    VkDeviceSize size,
+    VkMemoryMapFlags flags,
+    void** ppData);
+static VKAPI_ATTR void VKAPI_CALL internal_vkUnmapMemory(
+    VkDevice device,
+    VkDeviceMemory memory);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkFlushMappedMemoryRanges(
+    VkDevice device,
+    uint32_t memoryRangeCount,
+    const VkMappedMemoryRange* pMemoryRanges);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkInvalidateMappedMemoryRanges(
+    VkDevice device,
+    uint32_t memoryRangeCount,
+    const VkMappedMemoryRange* pMemoryRanges);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2KHR(
+    VkDevice device,
+    const VkMemoryMapInfoKHR* pMemoryMapInfo,
+    void** ppData);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2(
+    VkDevice device,
+    const VkMemoryMapInfo* pMemoryMapInfo,
+    void** ppData);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2KHR(
+    VkDevice device,
+    const VkMemoryUnmapInfoKHR* pMemoryUnmapInfo);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2(
+    VkDevice device,
+    const VkMemoryUnmapInfo* pMemoryUnmapInfo);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit(
+    VkQueue queue,
+    uint32_t submitCount,
+    const VkSubmitInfo* pSubmits,
+    VkFence fence);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit2(
+    VkQueue queue,
+    uint32_t submitCount,
+    const VkSubmitInfo2* pSubmits,
+    VkFence fence);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit2KHR(
+    VkQueue queue,
+    uint32_t submitCount,
+    const VkSubmitInfo2KHR* pSubmits,
+    VkFence fence);
 
 static VKAPI_ATTR VkResult VKAPI_CALL wrapper_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pSwapchainCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain);
 
@@ -558,6 +847,552 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetInstanceProcAddr(V
     return nullptr;
 }
 
+template <typename T>
+static T get_mali_device_proc(VkDevice device, const char* proc_name)
+{
+    using namespace mali_wrapper;
+
+    auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
+    if (!mali_proc_addr) {
+        return nullptr;
+    }
+
+    VkInstance parent_instance = get_device_parent_instance(device);
+    if (parent_instance == VK_NULL_HANDLE) {
+        return nullptr;
+    }
+
+    auto mali_get_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        mali_proc_addr(parent_instance, "vkGetDeviceProcAddr"));
+    if (!mali_get_device_proc_addr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<T>(mali_get_device_proc_addr(device, proc_name));
+}
+
+static void maybe_apply_shadow_mapping(VkDevice device, VkDeviceMemory memory,
+                                       VkDeviceSize offset, VkDeviceSize size, void** ppData)
+{
+    using namespace mali_wrapper;
+
+    if (ppData == nullptr || *ppData == nullptr) {
+        return;
+    }
+
+    if (is_pointer_32bit_compatible(*ppData)) {
+        return;
+    }
+
+    if (!should_use_low_address_shadow_map()) {
+        return;
+    }
+
+    const DeviceMemoryKey key = make_memory_key(device, memory);
+
+    VkDeviceSize resolved_size = 0;
+    {
+        std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+        if (!resolve_map_size_locked(key, offset, size, &resolved_size)) {
+            LOG_WARN("Low-address map workaround skipped: unable to resolve mapping size");
+            return;
+        }
+    }
+
+    if (resolved_size == 0 || resolved_size > static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max())) {
+        LOG_WARN("Low-address map workaround skipped: mapping size is unsupported");
+        return;
+    }
+
+    size_t shadow_size = 0;
+    void* shadow_ptr = allocate_low_address_shadow(static_cast<size_t>(resolved_size), &shadow_size);
+    if (shadow_ptr == nullptr) {
+        LOG_WARN("Low-address map workaround failed: unable to allocate shadow mapping");
+        return;
+    }
+
+    std::memcpy(shadow_ptr, *ppData, static_cast<size_t>(resolved_size));
+
+    ShadowMappingInfo stale_mapping{};
+    bool has_stale_mapping = false;
+    {
+        std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+        auto it = shadow_mappings.find(key);
+        if (it != shadow_mappings.end()) {
+            stale_mapping = it->second;
+            has_stale_mapping = true;
+            it->second = ShadowMappingInfo{ *ppData, shadow_ptr, shadow_size, offset, resolved_size };
+        } else {
+            shadow_mappings.emplace(key, ShadowMappingInfo{ *ppData, shadow_ptr, shadow_size, offset, resolved_size });
+        }
+    }
+
+    if (has_stale_mapping && stale_mapping.shadow_ptr != nullptr && stale_mapping.shadow_size > 0) {
+        munmap(stale_mapping.shadow_ptr, stale_mapping.shadow_size);
+    }
+
+    *ppData = shadow_ptr;
+}
+
+static void sync_shadow_to_real(VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange* pMemoryRanges)
+{
+    using namespace mali_wrapper;
+
+    if (memoryRangeCount == 0 || pMemoryRanges == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+    for (uint32_t i = 0; i < memoryRangeCount; i++) {
+        const VkMappedMemoryRange& range = pMemoryRanges[i];
+        const DeviceMemoryKey key = make_memory_key(device, range.memory);
+        auto map_it = shadow_mappings.find(key);
+        if (map_it == shadow_mappings.end()) {
+            continue;
+        }
+
+        size_t byte_offset = 0;
+        size_t byte_count = 0;
+        if (!compute_copy_region(map_it->second, range.offset, range.size, &byte_offset, &byte_count)) {
+            continue;
+        }
+
+        auto* shadow_bytes = static_cast<const uint8_t*>(map_it->second.shadow_ptr);
+        auto* real_bytes = static_cast<uint8_t*>(map_it->second.real_ptr);
+        std::memcpy(real_bytes + byte_offset, shadow_bytes + byte_offset, byte_count);
+    }
+}
+
+static void sync_real_to_shadow(VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange* pMemoryRanges)
+{
+    using namespace mali_wrapper;
+
+    if (memoryRangeCount == 0 || pMemoryRanges == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+    for (uint32_t i = 0; i < memoryRangeCount; i++) {
+        const VkMappedMemoryRange& range = pMemoryRanges[i];
+        const DeviceMemoryKey key = make_memory_key(device, range.memory);
+        auto map_it = shadow_mappings.find(key);
+        if (map_it == shadow_mappings.end()) {
+            continue;
+        }
+
+        size_t byte_offset = 0;
+        size_t byte_count = 0;
+        if (!compute_copy_region(map_it->second, range.offset, range.size, &byte_offset, &byte_count)) {
+            continue;
+        }
+
+        auto* shadow_bytes = static_cast<uint8_t*>(map_it->second.shadow_ptr);
+        auto* real_bytes = static_cast<const uint8_t*>(map_it->second.real_ptr);
+        std::memcpy(shadow_bytes + byte_offset, real_bytes + byte_offset, byte_count);
+    }
+}
+
+static void sync_all_shadows_for_device(VkDevice device)
+{
+    using namespace mali_wrapper;
+
+    if (device == VK_NULL_HANDLE) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+    for (auto& entry : shadow_mappings) {
+        if (entry.first.device != device) {
+            continue;
+        }
+
+        auto& mapping = entry.second;
+        if (mapping.real_ptr == nullptr || mapping.shadow_ptr == nullptr ||
+            mapping.mapped_size == 0 ||
+            mapping.mapped_size > static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max())) {
+            continue;
+        }
+
+        std::memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size));
+    }
+}
+
+static void sync_all_shadows()
+{
+    using namespace mali_wrapper;
+
+    std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+    for (auto& entry : shadow_mappings) {
+        auto& mapping = entry.second;
+        if (mapping.real_ptr == nullptr || mapping.shadow_ptr == nullptr ||
+            mapping.mapped_size == 0 ||
+            mapping.mapped_size > static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max())) {
+            continue;
+        }
+
+        std::memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size));
+    }
+}
+
+static VkDevice get_queue_parent_device_safe(VkQueue queue)
+{
+    if (queue == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+
+    try {
+        auto& queue_device_data = mali_wrapper::device_private_data::get(queue);
+        return queue_device_data.device;
+    } catch (...) {
+        return VK_NULL_HANDLE;
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkAllocateMemory(
+    VkDevice device,
+    const VkMemoryAllocateInfo* pAllocateInfo,
+    const VkAllocationCallbacks* pAllocator,
+    VkDeviceMemory* pMemory)
+{
+    using namespace mali_wrapper;
+
+    auto mali_allocate_memory = get_mali_device_proc<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
+    if (!mali_allocate_memory) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    const VkResult result = mali_allocate_memory(device, pAllocateInfo, pAllocator, pMemory);
+    if (result == VK_SUCCESS && pMemory != nullptr && *pMemory != VK_NULL_HANDLE && pAllocateInfo != nullptr) {
+        std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+        tracked_memory_allocations[make_memory_key(device, *pMemory)] = pAllocateInfo->allocationSize;
+    }
+
+    return result;
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkFreeMemory(
+    VkDevice device,
+    VkDeviceMemory memory,
+    const VkAllocationCallbacks* pAllocator)
+{
+    using namespace mali_wrapper;
+
+    ShadowMappingInfo stale_mapping{};
+    bool has_stale_mapping = false;
+
+    {
+        std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+        const DeviceMemoryKey key = make_memory_key(device, memory);
+        tracked_memory_allocations.erase(key);
+
+        auto mapping_it = shadow_mappings.find(key);
+        if (mapping_it != shadow_mappings.end()) {
+            stale_mapping = mapping_it->second;
+            has_stale_mapping = true;
+            shadow_mappings.erase(mapping_it);
+        }
+    }
+
+    if (has_stale_mapping && stale_mapping.shadow_ptr != nullptr && stale_mapping.shadow_size > 0) {
+        munmap(stale_mapping.shadow_ptr, stale_mapping.shadow_size);
+    }
+
+    auto mali_free_memory = get_mali_device_proc<PFN_vkFreeMemory>(device, "vkFreeMemory");
+    if (mali_free_memory) {
+        mali_free_memory(device, memory, pAllocator);
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory(
+    VkDevice device,
+    VkDeviceMemory memory,
+    VkDeviceSize offset,
+    VkDeviceSize size,
+    VkMemoryMapFlags flags,
+    void** ppData)
+{
+    auto mali_map_memory = get_mali_device_proc<PFN_vkMapMemory>(device, "vkMapMemory");
+    if (!mali_map_memory) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkResult result = mali_map_memory(device, memory, offset, size, flags, ppData);
+    if (result == VK_SUCCESS) {
+        maybe_apply_shadow_mapping(device, memory, offset, size, ppData);
+    }
+
+    return result;
+}
+
+static bool pop_shadow_mapping(VkDevice device, VkDeviceMemory memory, mali_wrapper::ShadowMappingInfo* out_mapping)
+{
+    using namespace mali_wrapper;
+
+    if (out_mapping == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(memory_tracking_mutex);
+    const DeviceMemoryKey key = make_memory_key(device, memory);
+    auto mapping_it = shadow_mappings.find(key);
+    if (mapping_it == shadow_mappings.end()) {
+        return false;
+    }
+
+    *out_mapping = mapping_it->second;
+    shadow_mappings.erase(mapping_it);
+    return true;
+}
+
+static void finalize_shadow_mapping(mali_wrapper::ShadowMappingInfo& mapping)
+{
+    if (mapping.real_ptr != nullptr && mapping.shadow_ptr != nullptr &&
+        mapping.mapped_size > 0 &&
+        mapping.mapped_size <= static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max())) {
+        std::memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size));
+    }
+
+    if (mapping.shadow_ptr != nullptr && mapping.shadow_size > 0) {
+        munmap(mapping.shadow_ptr, mapping.shadow_size);
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkUnmapMemory(
+    VkDevice device,
+    VkDeviceMemory memory)
+{
+    mali_wrapper::ShadowMappingInfo mapping{};
+    if (pop_shadow_mapping(device, memory, &mapping)) {
+        finalize_shadow_mapping(mapping);
+    }
+
+    auto mali_unmap_memory = get_mali_device_proc<PFN_vkUnmapMemory>(device, "vkUnmapMemory");
+    if (mali_unmap_memory) {
+        mali_unmap_memory(device, memory);
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkFlushMappedMemoryRanges(
+    VkDevice device,
+    uint32_t memoryRangeCount,
+    const VkMappedMemoryRange* pMemoryRanges)
+{
+    auto mali_flush = get_mali_device_proc<PFN_vkFlushMappedMemoryRanges>(device, "vkFlushMappedMemoryRanges");
+    if (!mali_flush) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    sync_shadow_to_real(device, memoryRangeCount, pMemoryRanges);
+    return mali_flush(device, memoryRangeCount, pMemoryRanges);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkInvalidateMappedMemoryRanges(
+    VkDevice device,
+    uint32_t memoryRangeCount,
+    const VkMappedMemoryRange* pMemoryRanges)
+{
+    auto mali_invalidate = get_mali_device_proc<PFN_vkInvalidateMappedMemoryRanges>(device, "vkInvalidateMappedMemoryRanges");
+    if (!mali_invalidate) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    const VkResult result = mali_invalidate(device, memoryRangeCount, pMemoryRanges);
+    if (result == VK_SUCCESS) {
+        sync_real_to_shadow(device, memoryRangeCount, pMemoryRanges);
+    }
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2KHR(
+    VkDevice device,
+    const VkMemoryMapInfoKHR* pMemoryMapInfo,
+    void** ppData)
+{
+    if (pMemoryMapInfo == nullptr || ppData == nullptr) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    auto mali_map_memory2 = get_mali_device_proc<PFN_vkMapMemory2KHR>(device, "vkMapMemory2KHR");
+    if (!mali_map_memory2) {
+        mali_map_memory2 = reinterpret_cast<PFN_vkMapMemory2KHR>(
+            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkMapMemory2"));
+    }
+    if (!mali_map_memory2) {
+        // Some drivers do not expose VK_KHR_map_memory2 even though vkMapMemory works.
+        return internal_vkMapMemory(device, pMemoryMapInfo->memory, pMemoryMapInfo->offset,
+                                    pMemoryMapInfo->size, pMemoryMapInfo->flags, ppData);
+    }
+
+    VkResult result = mali_map_memory2(device, pMemoryMapInfo, ppData);
+    if (result == VK_SUCCESS) {
+        maybe_apply_shadow_mapping(device, pMemoryMapInfo->memory, pMemoryMapInfo->offset, pMemoryMapInfo->size, ppData);
+    }
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2(
+    VkDevice device,
+    const VkMemoryMapInfo* pMemoryMapInfo,
+    void** ppData)
+{
+    if (pMemoryMapInfo == nullptr || ppData == nullptr) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    auto mali_map_memory2 = get_mali_device_proc<PFN_vkMapMemory2>(device, "vkMapMemory2");
+    if (!mali_map_memory2) {
+        mali_map_memory2 = reinterpret_cast<PFN_vkMapMemory2>(
+            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkMapMemory2KHR"));
+    }
+    if (!mali_map_memory2) {
+        return internal_vkMapMemory(device, pMemoryMapInfo->memory, pMemoryMapInfo->offset,
+                                    pMemoryMapInfo->size, pMemoryMapInfo->flags, ppData);
+    }
+
+    VkResult result = mali_map_memory2(device, pMemoryMapInfo, ppData);
+    if (result == VK_SUCCESS) {
+        maybe_apply_shadow_mapping(device, pMemoryMapInfo->memory, pMemoryMapInfo->offset, pMemoryMapInfo->size, ppData);
+    }
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2KHR(
+    VkDevice device,
+    const VkMemoryUnmapInfoKHR* pMemoryUnmapInfo)
+{
+    if (pMemoryUnmapInfo != nullptr) {
+        mali_wrapper::ShadowMappingInfo mapping{};
+        if (pop_shadow_mapping(device, pMemoryUnmapInfo->memory, &mapping)) {
+            finalize_shadow_mapping(mapping);
+        }
+    }
+
+    auto mali_unmap2 = get_mali_device_proc<PFN_vkUnmapMemory2KHR>(device, "vkUnmapMemory2KHR");
+    if (!mali_unmap2) {
+        mali_unmap2 = reinterpret_cast<PFN_vkUnmapMemory2KHR>(
+            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkUnmapMemory2"));
+    }
+    if (!mali_unmap2) {
+        return VK_SUCCESS;
+    }
+
+    return mali_unmap2(device, pMemoryUnmapInfo);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2(
+    VkDevice device,
+    const VkMemoryUnmapInfo* pMemoryUnmapInfo)
+{
+    if (pMemoryUnmapInfo != nullptr) {
+        mali_wrapper::ShadowMappingInfo mapping{};
+        if (pop_shadow_mapping(device, pMemoryUnmapInfo->memory, &mapping)) {
+            finalize_shadow_mapping(mapping);
+        }
+    }
+
+    auto mali_unmap2 = get_mali_device_proc<PFN_vkUnmapMemory2>(device, "vkUnmapMemory2");
+    if (!mali_unmap2) {
+        mali_unmap2 = reinterpret_cast<PFN_vkUnmapMemory2>(
+            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkUnmapMemory2KHR"));
+    }
+    if (!mali_unmap2) {
+        return VK_SUCCESS;
+    }
+
+    return mali_unmap2(device, pMemoryUnmapInfo);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit(
+    VkQueue queue,
+    uint32_t submitCount,
+    const VkSubmitInfo* pSubmits,
+    VkFence fence)
+{
+    VkDevice device = get_queue_parent_device_safe(queue);
+    if (device != VK_NULL_HANDLE) {
+        sync_all_shadows_for_device(device);
+    } else {
+        sync_all_shadows();
+    }
+
+    auto mali_queue_submit = (device != VK_NULL_HANDLE)
+                                 ? get_mali_device_proc<PFN_vkQueueSubmit>(device, "vkQueueSubmit")
+                                 : nullptr;
+    if (!mali_queue_submit) {
+        const VkDevice fallback_device = mali_wrapper::get_any_managed_device();
+        if (fallback_device != VK_NULL_HANDLE) {
+            mali_queue_submit = get_mali_device_proc<PFN_vkQueueSubmit>(fallback_device, "vkQueueSubmit");
+        }
+    }
+    if (!mali_queue_submit) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    return mali_queue_submit(queue, submitCount, pSubmits, fence);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit2(
+    VkQueue queue,
+    uint32_t submitCount,
+    const VkSubmitInfo2* pSubmits,
+    VkFence fence)
+{
+    VkDevice device = get_queue_parent_device_safe(queue);
+    if (device != VK_NULL_HANDLE) {
+        sync_all_shadows_for_device(device);
+    } else {
+        sync_all_shadows();
+        device = mali_wrapper::get_any_managed_device();
+    }
+
+    if (device == VK_NULL_HANDLE) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    auto mali_queue_submit2 = get_mali_device_proc<PFN_vkQueueSubmit2>(device, "vkQueueSubmit2");
+    if (mali_queue_submit2) {
+        return mali_queue_submit2(queue, submitCount, pSubmits, fence);
+    }
+
+    auto mali_queue_submit2_khr = get_mali_device_proc<PFN_vkQueueSubmit2KHR>(device, "vkQueueSubmit2KHR");
+    if (!mali_queue_submit2_khr) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    return mali_queue_submit2_khr(queue, submitCount, reinterpret_cast<const VkSubmitInfo2KHR*>(pSubmits), fence);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit2KHR(
+    VkQueue queue,
+    uint32_t submitCount,
+    const VkSubmitInfo2KHR* pSubmits,
+    VkFence fence)
+{
+    VkDevice device = get_queue_parent_device_safe(queue);
+    if (device != VK_NULL_HANDLE) {
+        sync_all_shadows_for_device(device);
+    } else {
+        sync_all_shadows();
+        device = mali_wrapper::get_any_managed_device();
+    }
+
+    if (device == VK_NULL_HANDLE) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    auto mali_queue_submit2_khr = get_mali_device_proc<PFN_vkQueueSubmit2KHR>(device, "vkQueueSubmit2KHR");
+    if (mali_queue_submit2_khr) {
+        return mali_queue_submit2_khr(queue, submitCount, pSubmits, fence);
+    }
+
+    auto mali_queue_submit2 = get_mali_device_proc<PFN_vkQueueSubmit2>(device, "vkQueueSubmit2");
+    if (!mali_queue_submit2) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    return mali_queue_submit2(queue, submitCount, reinterpret_cast<const VkSubmitInfo2*>(pSubmits), fence);
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
     using namespace mali_wrapper;
 
@@ -571,6 +1406,46 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
 
     if (strcmp(pName, "vkDestroyDevice") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkDestroyDevice);
+    }
+
+    if (strcmp(pName, "vkAllocateMemory") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkAllocateMemory);
+    }
+    if (strcmp(pName, "vkFreeMemory") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkFreeMemory);
+    }
+    if (strcmp(pName, "vkMapMemory") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkMapMemory);
+    }
+    if (strcmp(pName, "vkUnmapMemory") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkUnmapMemory);
+    }
+    if (strcmp(pName, "vkFlushMappedMemoryRanges") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkFlushMappedMemoryRanges);
+    }
+    if (strcmp(pName, "vkInvalidateMappedMemoryRanges") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkInvalidateMappedMemoryRanges);
+    }
+    if (strcmp(pName, "vkQueueSubmit") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkQueueSubmit);
+    }
+    if (strcmp(pName, "vkQueueSubmit2") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkQueueSubmit2);
+    }
+    if (strcmp(pName, "vkQueueSubmit2KHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkQueueSubmit2KHR);
+    }
+    if (strcmp(pName, "vkMapMemory2KHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkMapMemory2KHR);
+    }
+    if (strcmp(pName, "vkMapMemory2") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkMapMemory2);
+    }
+    if (strcmp(pName, "vkUnmapMemory2KHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkUnmapMemory2KHR);
+    }
+    if (strcmp(pName, "vkUnmapMemory2") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkUnmapMemory2);
     }
 
     if (GetWSIManager().is_wsi_function(pName)) {
@@ -838,6 +1713,8 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyDevice(
     if (device == VK_NULL_HANDLE) {
         return;
     }
+
+    remove_tracking_for_device(device);
 
     VkInstance parent_instance = get_device_parent_instance(device);
 
