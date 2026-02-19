@@ -75,7 +75,7 @@ static std::mutex memory_tracking_mutex;
 static std::unordered_map<DeviceMemoryKey, VkDeviceSize, DeviceMemoryKeyHash> tracked_memory_allocations;
 static std::unordered_map<DeviceMemoryKey, ShadowMappingInfo, DeviceMemoryKeyHash> shadow_mappings;
 
-static constexpr uintptr_t kMax32BitAddressExclusive = 0x100000000ULL;
+static constexpr uint64_t kMax32BitAddressExclusive = 0x100000000ULL;
 static constexpr uintptr_t kShadowSearchStart = 0x10000000ULL;
 static constexpr uintptr_t kShadowSearchEnd = 0xF0000000ULL;
 static constexpr uintptr_t kShadowSearchStep = 0x00100000ULL;
@@ -119,7 +119,7 @@ static bool should_use_low_address_shadow_map()
 
 static bool is_pointer_32bit_compatible(const void* ptr)
 {
-    return reinterpret_cast<uintptr_t>(ptr) < kMax32BitAddressExclusive;
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)) < kMax32BitAddressExclusive;
 }
 
 static bool resolve_map_size_locked(const DeviceMemoryKey& key, VkDeviceSize offset,
@@ -202,8 +202,9 @@ static void* allocate_low_address_shadow(size_t requested_size, size_t* out_shad
     void* mapped = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (mapped != MAP_FAILED) {
-        const uintptr_t mapped_addr = reinterpret_cast<uintptr_t>(mapped);
-        if (mapped_addr + aligned_size <= kMax32BitAddressExclusive) {
+        const uint64_t mapped_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mapped));
+        const uint64_t mapped_end = mapped_addr + static_cast<uint64_t>(aligned_size);
+        if (mapped_end <= kMax32BitAddressExclusive) {
             *out_shadow_size = aligned_size;
             return mapped;
         }
@@ -212,7 +213,8 @@ static void* allocate_low_address_shadow(size_t requested_size, size_t* out_shad
 #endif
 
     for (uintptr_t addr = kShadowSearchStart;
-         addr < kShadowSearchEnd && addr + aligned_size < kMax32BitAddressExclusive;
+         addr < kShadowSearchEnd &&
+             static_cast<uint64_t>(addr) + static_cast<uint64_t>(aligned_size) < kMax32BitAddressExclusive;
          addr += kShadowSearchStep) {
         void* mapped = mmap(reinterpret_cast<void*>(addr), aligned_size, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -450,16 +452,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2KHR(
     VkDevice device,
     const VkMemoryMapInfoKHR* pMemoryMapInfo,
     void** ppData);
-static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2(
-    VkDevice device,
-    const VkMemoryMapInfo* pMemoryMapInfo,
-    void** ppData);
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2KHR(
     VkDevice device,
     const VkMemoryUnmapInfoKHR* pMemoryUnmapInfo);
-static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2(
-    VkDevice device,
-    const VkMemoryUnmapInfo* pMemoryUnmapInfo);
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit(
     VkQueue queue,
     uint32_t submitCount,
@@ -1230,32 +1225,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2KHR(
     return result;
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2(
-    VkDevice device,
-    const VkMemoryMapInfo* pMemoryMapInfo,
-    void** ppData)
-{
-    if (pMemoryMapInfo == nullptr || ppData == nullptr) {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-
-    auto mali_map_memory2 = get_mali_device_proc<PFN_vkMapMemory2>(device, "vkMapMemory2");
-    if (!mali_map_memory2) {
-        mali_map_memory2 = reinterpret_cast<PFN_vkMapMemory2>(
-            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkMapMemory2KHR"));
-    }
-    if (!mali_map_memory2) {
-        return internal_vkMapMemory(device, pMemoryMapInfo->memory, pMemoryMapInfo->offset,
-                                    pMemoryMapInfo->size, pMemoryMapInfo->flags, ppData);
-    }
-
-    VkResult result = mali_map_memory2(device, pMemoryMapInfo, ppData);
-    if (result == VK_SUCCESS) {
-        maybe_apply_shadow_mapping(device, pMemoryMapInfo->memory, pMemoryMapInfo->offset, pMemoryMapInfo->size, ppData);
-    }
-    return result;
-}
-
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2KHR(
     VkDevice device,
     const VkMemoryUnmapInfoKHR* pMemoryUnmapInfo)
@@ -1271,29 +1240,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2KHR(
     if (!mali_unmap2) {
         mali_unmap2 = reinterpret_cast<PFN_vkUnmapMemory2KHR>(
             get_mali_device_proc<PFN_vkVoidFunction>(device, "vkUnmapMemory2"));
-    }
-    if (!mali_unmap2) {
-        return VK_SUCCESS;
-    }
-
-    return mali_unmap2(device, pMemoryUnmapInfo);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2(
-    VkDevice device,
-    const VkMemoryUnmapInfo* pMemoryUnmapInfo)
-{
-    if (pMemoryUnmapInfo != nullptr) {
-        mali_wrapper::ShadowMappingInfo mapping{};
-        if (pop_shadow_mapping(device, pMemoryUnmapInfo->memory, &mapping)) {
-            finalize_shadow_mapping(mapping);
-        }
-    }
-
-    auto mali_unmap2 = get_mali_device_proc<PFN_vkUnmapMemory2>(device, "vkUnmapMemory2");
-    if (!mali_unmap2) {
-        mali_unmap2 = reinterpret_cast<PFN_vkUnmapMemory2>(
-            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkUnmapMemory2KHR"));
     }
     if (!mali_unmap2) {
         return VK_SUCCESS;
@@ -1439,13 +1385,13 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkMapMemory2KHR);
     }
     if (strcmp(pName, "vkMapMemory2") == 0) {
-        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkMapMemory2);
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkMapMemory2KHR);
     }
     if (strcmp(pName, "vkUnmapMemory2KHR") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkUnmapMemory2KHR);
     }
     if (strcmp(pName, "vkUnmapMemory2") == 0) {
-        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkUnmapMemory2);
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkUnmapMemory2KHR);
     }
 
     if (GetWSIManager().is_wsi_function(pName)) {
