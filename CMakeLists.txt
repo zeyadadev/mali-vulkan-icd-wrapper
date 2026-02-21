@@ -107,6 +107,7 @@ set(WSI_X11_SOURCES
     src/wsi/x11/swapchain.cpp
     src/wsi/x11/shm_presenter.cpp
     src/wsi/x11/drm_display.cpp
+    src/wsi/x11/xwayland_dmabuf_bridge.cpp
 )
 
 # Platform-specific WSI sources (Wayland)

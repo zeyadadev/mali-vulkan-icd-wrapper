@@ -616,6 +616,13 @@ protected:
 private:
    std::mutex m_image_acquire_lock;
    /**
+    * @brief Round-robin hint for acquire image selection.
+    *
+    * Without this hint, acquire_next_image() always starts searching from index 0,
+    * which can repeatedly select the same image and reduce effective buffering.
+    */
+   uint32_t m_next_image_index_hint{ 0 };
+   /**
     * @brief In case we encounter threading or drm errors we need a way to
     * notify the user of the failure. While no error has occurred its value
     * is VK_SUCCESS. When an error occurs, its value is set to the

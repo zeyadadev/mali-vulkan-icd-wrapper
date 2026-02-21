@@ -31,6 +31,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <new>
+#include <atomic>
 
 #include "wsi/wsi_private_data.hpp"
 #include "swapchain_api.hpp"
@@ -155,6 +156,12 @@ wsi_layer_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapc, uint64_t 
 
    if (!device_data.layer_owns_swapchain(swapc))
    {
+      static std::atomic<bool> warned_forward_acquire{ false };
+      bool expected = false;
+      if (warned_forward_acquire.compare_exchange_strong(expected, true))
+      {
+         WSI_LOG_WARNING("vkAcquireNextImageKHR forwarded to ICD: swapchain=%p is not layer-owned", (void *)swapc);
+      }
       return device_data.disp.AcquireNextImageKHR(device_data.device, swapc, timeout, semaphore, fence, pImageIndex);
    }
 
@@ -162,7 +169,13 @@ wsi_layer_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapc, uint64_t 
    assert(semaphore != VK_NULL_HANDLE || fence != VK_NULL_HANDLE);
    assert(pImageIndex != nullptr);
    auto *sc = reinterpret_cast<wsi::swapchain_base *>(swapc);
-   return sc->acquire_next_image(timeout, semaphore, fence, pImageIndex);
+   VkResult res = sc->acquire_next_image(timeout, semaphore, fence, pImageIndex);
+   if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+   {
+      WSI_LOG_ERROR("vkAcquireNextImageKHR failed: result=%d swapchain=%p timeout=%llu", res, (void *)swapc,
+                    static_cast<unsigned long long>(timeout));
+   }
+   return res;
 }
 
 static VkResult submit_wait_request(VkQueue queue, const VkPresentInfoKHR &present_info,
@@ -209,6 +222,12 @@ wsi_layer_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 
    if (!device_data.layer_owns_all_swapchains(pPresentInfo->pSwapchains, pPresentInfo->swapchainCount))
    {
+      static std::atomic<bool> warned_forward_present{ false };
+      bool expected = false;
+      if (warned_forward_present.compare_exchange_strong(expected, true))
+      {
+         WSI_LOG_WARNING("vkQueuePresentKHR forwarded to ICD: at least one swapchain is not layer-owned");
+      }
       return device_data.disp.QueuePresentKHR(queue, pPresentInfo);
    }
 
@@ -274,6 +293,12 @@ wsi_layer_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
       if (pPresentInfo->pResults != nullptr)
       {
          pPresentInfo->pResults[i] = res;
+      }
+
+      if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+      {
+         WSI_LOG_ERROR("vkQueuePresentKHR failed for swapchain[%u]=%p imageIndex=%u result=%d", i,
+                       (void *)swapc, present_params.pending_present.image_index, res);
       }
 
       if (res != VK_SUCCESS && ret == VK_SUCCESS)
@@ -381,12 +406,25 @@ wsi_layer_vkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextImageInfoKH
 
    if (!device_data.layer_owns_swapchain(pAcquireInfo->swapchain))
    {
+      static std::atomic<bool> warned_forward_acquire2{ false };
+      bool expected = false;
+      if (warned_forward_acquire2.compare_exchange_strong(expected, true))
+      {
+         WSI_LOG_WARNING("vkAcquireNextImage2KHR forwarded to ICD: swapchain=%p is not layer-owned",
+                         (void *)pAcquireInfo->swapchain);
+      }
       return device_data.disp.AcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
    }
 
    auto *sc = reinterpret_cast<wsi::swapchain_base *>(pAcquireInfo->swapchain);
-
-   return sc->acquire_next_image(pAcquireInfo->timeout, pAcquireInfo->semaphore, pAcquireInfo->fence, pImageIndex);
+   VkResult res =
+      sc->acquire_next_image(pAcquireInfo->timeout, pAcquireInfo->semaphore, pAcquireInfo->fence, pImageIndex);
+   if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+   {
+      WSI_LOG_ERROR("vkAcquireNextImage2KHR failed: result=%d swapchain=%p timeout=%llu", res,
+                    (void *)pAcquireInfo->swapchain, static_cast<unsigned long long>(pAcquireInfo->timeout));
+   }
+   return res;
 }
 
 VWL_VKAPI_CALL(VkResult)

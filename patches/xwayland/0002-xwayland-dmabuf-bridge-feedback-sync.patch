@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Mali Wrapper <devnull@example.com>
+Date: Sat, 21 Feb 2026 19:58:00 +0000
+Subject: [PATCH] xwayland: add dmabuf bridge feedback sync opcodes
+
+---
+--- a/hw/xwayland/xwayland-dmabuf-bridge.h
++++ b/hw/xwayland/xwayland-dmabuf-bridge.h
+@@ -39,6 +39,13 @@
+ enum xwl_dmabuf_bridge_opcode {
+     XWL_DMABUF_BRIDGE_OP_FRAME = 1,
+     XWL_DMABUF_BRIDGE_OP_STOP = 2,
++    XWL_DMABUF_BRIDGE_OP_HELLO = 3,
++    XWL_DMABUF_BRIDGE_OP_FEEDBACK = 4,
++};
++
++enum xwl_dmabuf_bridge_feedback_flags {
++    XWL_DMABUF_BRIDGE_FEEDBACK_FAILED = 1u << 0,
++    XWL_DMABUF_BRIDGE_FEEDBACK_CAP_SYNC = 1u << 16,
+ };
+ 
+ struct xwl_dmabuf_bridge_plane {
+--- a/hw/xwayland/xwayland-dmabuf-bridge.c
++++ b/hw/xwayland/xwayland-dmabuf-bridge.c
+@@ -61,12 +61,15 @@
+ };
+ 
+ struct xwl_dmabuf_bridge_buffer {
+-    int dummy;
++    int feedback_fd;
++    XID xid;
++    uint32_t frame_id;
+ };
+ 
+ struct xwl_dmabuf_bridge_pending_frame {
+     struct xwl_screen *xwl_screen;
+     XID xid;
++    uint32_t frame_id;
+     uint32_t width;
+     uint32_t height;
+     uint32_t format;
+@@ -74,6 +77,7 @@
+     uint32_t num_planes;
+     struct xwl_dmabuf_bridge_plane planes[XWL_DMABUF_BRIDGE_MAX_PLANES];
+     int fds[XWL_DMABUF_BRIDGE_MAX_PLANES];
++    int feedback_fd;
+     Bool retry_implicit;
+ };
+ 
+@@ -95,9 +99,43 @@
+         return;
+ 
+     xwl_dmabuf_bridge_close_fds(pending->fds, pending->num_planes);
++    if (pending->feedback_fd >= 0)
++        close(pending->feedback_fd);
+     free(pending);
+ }
+ 
++static void
++xwl_dmabuf_bridge_send_feedback_fd(int fd, XID xid, uint32_t frame_id, uint32_t flags)
++{
++    struct xwl_dmabuf_bridge_packet packet;
++    ssize_t ret;
++
++    if (fd < 0)
++        return;
++
++    memset(&packet, 0, sizeof(packet));
++    packet.magic = XWL_DMABUF_BRIDGE_MAGIC;
++    packet.version = XWL_DMABUF_BRIDGE_VERSION;
++    packet.opcode = XWL_DMABUF_BRIDGE_OP_FEEDBACK;
++    packet.xid = xid;
++    packet.flags = flags;
++    packet.reserved = frame_id;
++
++    ret = send(fd, &packet, sizeof(packet), MSG_DONTWAIT | MSG_NOSIGNAL);
++    if (ret < 0) {
++        if (errno != EAGAIN && errno != EWOULDBLOCK) {
++            ErrorF("xwayland dmabuf bridge: failed to send feedback xid=0x%x frame=%u: %s\n",
++                   xid, frame_id, strerror(errno));
++        }
++        return;
++    }
++
++    if ((size_t) ret != sizeof(packet)) {
++        ErrorF("xwayland dmabuf bridge: short feedback send xid=0x%x frame=%u (%zd/%zu)\n",
++               xid, frame_id, ret, sizeof(packet));
++    }
++}
++
+ static Bool
+ xwl_dmabuf_bridge_set_nonblocking_cloexec(int fd)
+ {
+@@ -167,6 +205,11 @@
+ {
+     struct xwl_dmabuf_bridge_buffer *bridge_buffer = data;
+ 
++    xwl_dmabuf_bridge_send_feedback_fd(bridge_buffer->feedback_fd, bridge_buffer->xid,
++                                       bridge_buffer->frame_id, 0);
++    if (bridge_buffer->feedback_fd >= 0)
++        close(bridge_buffer->feedback_fd);
++
+     wl_buffer_destroy(buffer);
+     free(bridge_buffer);
+ }
+@@ -181,7 +224,8 @@
+ static Bool
+ xwl_dmabuf_bridge_commit_buffer(struct xwl_screen *xwl_screen, XID xid,
+                                 struct wl_buffer *buffer,
+-                                uint32_t width, uint32_t height)
++                                uint32_t width, uint32_t height,
++                                int feedback_fd, uint32_t frame_id)
+ {
+     struct xwl_dmabuf_bridge_buffer *bridge_buffer;
+     struct xwl_window *xwl_window;
+@@ -197,6 +241,9 @@
+         wl_buffer_destroy(buffer);
+         return FALSE;
+     }
++    bridge_buffer->feedback_fd = feedback_fd;
++    bridge_buffer->xid = xid;
++    bridge_buffer->frame_id = frame_id;
+ 
+     wl_buffer_add_listener(buffer,
+                            &xwl_dmabuf_bridge_buffer_listener,
+@@ -238,10 +285,16 @@
+ 
+     if (!xwl_dmabuf_bridge_commit_buffer(pending->xwl_screen, pending->xid,
+                                          buffer, pending->width,
+-                                         pending->height)) {
++                                         pending->height, pending->feedback_fd,
++                                         pending->frame_id)) {
+         ErrorF("xwayland dmabuf bridge: failed to commit created buffer xid=0x%x size=%ux%u format=0x%08x modifier=0x%016llx\n",
+                pending->xid, pending->width, pending->height, pending->format,
+                (unsigned long long) pending->modifier);
++        xwl_dmabuf_bridge_send_feedback_fd(pending->feedback_fd, pending->xid, pending->frame_id,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
++    } else {
++        /* Feedback ownership transferred to wl_buffer release listener. */
++        pending->feedback_fd = -1;
+     }
+ 
+ out:
+@@ -303,6 +356,8 @@
+                pending->xid, pending->width, pending->height, pending->format,
+                (unsigned long long) pending->modifier, pending->num_planes,
+                pending->planes[0].offset, pending->planes[0].stride);
++        xwl_dmabuf_bridge_send_feedback_fd(pending->feedback_fd, pending->xid, pending->frame_id,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+     } else {
+         ErrorF("xwayland dmabuf bridge: compositor rejected dmabuf (missing pending state)\n");
+     }
+@@ -352,7 +407,8 @@
+ }
+ 
+ static Bool
+-xwl_dmabuf_bridge_submit_frame(struct xwl_screen *xwl_screen,
++xwl_dmabuf_bridge_submit_frame(struct xwl_dmabuf_bridge_client *client,
++                               struct xwl_screen *xwl_screen,
+                                const struct xwl_dmabuf_bridge_packet *packet,
+                                int *fds, size_t num_fds)
+ {
+@@ -362,62 +418,97 @@
+     uint64_t modifier;
+     uint32_t i;
+ 
+-    if (!xwl_screen->dmabuf)
++    if (!xwl_screen->dmabuf) {
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
++    }
+ 
+-    if (packet->width == 0 || packet->height == 0)
++    if (packet->width == 0 || packet->height == 0) {
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
++    }
+ 
+     if (packet->num_planes == 0 ||
+-        packet->num_planes > XWL_DMABUF_BRIDGE_MAX_PLANES)
++        packet->num_planes > XWL_DMABUF_BRIDGE_MAX_PLANES) {
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
++    }
+ 
+-    if (packet->num_planes > num_fds)
++    if (packet->num_planes > num_fds) {
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
++    }
+ 
+     xwl_window = xwl_dmabuf_bridge_window_for_xid(xwl_screen, packet->xid);
+-    if (!xwl_window)
++    if (!xwl_window) {
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
++    }
+ 
+     modifier = ((uint64_t) packet->planes[0].modifier_hi << 32) |
+                (uint64_t) packet->planes[0].modifier_lo;
+     if (!xwl_glamor_is_modifier_supported(xwl_screen, packet->format, modifier)) {
+         ErrorF("xwayland dmabuf bridge: unsupported format/modifier format=0x%08x modifier=0x%016llx\n",
+                packet->format, (unsigned long long) modifier);
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
+     }
+ 
+     if (wl_display_flush(xwl_screen->display) < 0) {
+-        if (errno == EAGAIN)
++        if (errno == EAGAIN) {
++            xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                               XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+             return FALSE;
++        }
+         ErrorF("xwayland dmabuf bridge: wl_display_flush pre-import failed: %s\n",
+                strerror(errno));
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
+     }
+ 
+     params = zwp_linux_dmabuf_v1_create_params(xwl_screen->dmabuf);
+-    if (!params)
++    if (!params) {
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
++    }
+ 
+     pending = calloc(1, sizeof(*pending));
+     if (!pending) {
+         zwp_linux_buffer_params_v1_destroy(params);
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
+     }
+ 
+     pending->xwl_screen = xwl_screen;
+     pending->xid = packet->xid;
++    pending->frame_id = packet->reserved;
+     pending->width = packet->width;
+     pending->height = packet->height;
+     pending->format = packet->format;
+     pending->modifier = modifier;
+     pending->num_planes = packet->num_planes;
++    pending->feedback_fd = -1;
+     for (i = 0; i < packet->num_planes; i++)
+         pending->planes[i] = packet->planes[i];
+     for (i = 0; i < XWL_DMABUF_BRIDGE_MAX_PLANES; i++)
+         pending->fds[i] = -1;
+     pending->retry_implicit = FALSE;
+ 
++    pending->feedback_fd = dup(client->fd);
++    if (pending->feedback_fd < 0) {
++        ErrorF("xwayland dmabuf bridge: failed to dup feedback fd xid=0x%x frame=%u: %s\n",
++               pending->xid, pending->frame_id, strerror(errno));
++    }
++
+     for (i = 0; i < packet->num_planes; i++) {
+         pending->fds[i] = dup(fds[i]);
+         if (pending->fds[i] < 0) {
+@@ -425,6 +516,8 @@
+                    strerror(errno));
+             zwp_linux_buffer_params_v1_destroy(params);
+             xwl_dmabuf_bridge_pending_frame_destroy(pending);
++            xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                               XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+             return FALSE;
+         }
+     }
+@@ -434,6 +527,8 @@
+                                                 pending) < 0) {
+         zwp_linux_buffer_params_v1_destroy(params);
+         xwl_dmabuf_bridge_pending_frame_destroy(pending);
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
+     }
+ 
+@@ -456,6 +551,8 @@
+                strerror(errno));
+         zwp_linux_buffer_params_v1_destroy(params);
+         xwl_dmabuf_bridge_pending_frame_destroy(pending);
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
+     }
+ 
+@@ -587,12 +684,16 @@
+ 
+     switch (packet.opcode) {
+     case XWL_DMABUF_BRIDGE_OP_FRAME:
+-        xwl_dmabuf_bridge_submit_frame(client->xwl_screen, &packet,
++        xwl_dmabuf_bridge_submit_frame(client, client->xwl_screen, &packet,
+                                        fds, fd_count);
+         break;
+     case XWL_DMABUF_BRIDGE_OP_STOP:
+         xwl_dmabuf_bridge_stop_stream(client->xwl_screen, packet.xid);
+         break;
++    case XWL_DMABUF_BRIDGE_OP_HELLO:
++        xwl_dmabuf_bridge_send_feedback_fd(client->fd, 0, packet.reserved,
++                                           XWL_DMABUF_BRIDGE_FEEDBACK_CAP_SYNC);
++        break;
+     default:
+         break;
+     }
+--- a/hw/xwayland/DMABUF_BRIDGE.md
++++ b/hw/xwayland/DMABUF_BRIDGE.md
+@@ -19,6 +19,13 @@
+ enum xwl_dmabuf_bridge_opcode {
+     XWL_DMABUF_BRIDGE_OP_FRAME = 1,
+     XWL_DMABUF_BRIDGE_OP_STOP = 2,
++    XWL_DMABUF_BRIDGE_OP_HELLO = 3,
++    XWL_DMABUF_BRIDGE_OP_FEEDBACK = 4,
++};
++
++enum xwl_dmabuf_bridge_feedback_flags {
++    XWL_DMABUF_BRIDGE_FEEDBACK_FAILED = 1u << 0,
++    XWL_DMABUF_BRIDGE_FEEDBACK_CAP_SYNC = 1u << 16,
+ };
+ 
+ struct xwl_dmabuf_bridge_plane {
+@@ -52,6 +59,18 @@
+ - no FDs required
+ - Xwayland clears the per-window external streaming flag for `xid`
+ 
++For `XWL_DMABUF_BRIDGE_OP_HELLO`:
++- no FDs required
++- client should set `reserved` to a probe token
++- Xwayland replies with `XWL_DMABUF_BRIDGE_OP_FEEDBACK` and the same `reserved`
++- `flags` includes `XWL_DMABUF_BRIDGE_FEEDBACK_CAP_SYNC` when feedback sync is supported
++
++For `XWL_DMABUF_BRIDGE_OP_FEEDBACK`:
++- server-to-client packet only
++- `reserved` echoes the frame/probe token
++- `flags & XWL_DMABUF_BRIDGE_FEEDBACK_FAILED` indicates frame import/commit failure
++- `flags == 0` indicates successful buffer release from compositor (retire-like pacing signal)
++
+ ## Behavior
+ 
+ - Imported frames are committed directly on `xwl_window->surface`
+@@ -60,5 +79,4 @@
+ 
+ ## Notes
+ 
+-- This is a PoC transport and import path (no explicit completion/retire ACK yet)
+-- For production usage, add a small return channel for release notifications and backpressure
++- This is still a PoC path; feedback is import/commit level and not a full retire/release timeline

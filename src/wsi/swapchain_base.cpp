@@ -113,6 +113,8 @@ void swapchain_base::page_flip_thread()
       }
       if (vk_res != VK_SUCCESS)
       {
+         WSI_LOG_ERROR("Page flip: image_wait_present failed for image %u with result %d",
+                       submit_info.image_index, vk_res);
          set_error_state(vk_res);
          m_free_image_semaphore.post();
          continue;
@@ -221,6 +223,7 @@ swapchain_base::swapchain_base(wsi::device_private_data &dev_data, const VkAlloc
    , m_device(VK_NULL_HANDLE)
    , m_queue(VK_NULL_HANDLE)
    , m_image_create_info()
+   , m_next_image_index_hint(0)
    , m_image_acquire_lock()
    , m_error_state(VK_NOT_READY)
    , m_started_presenting(false)
@@ -422,17 +425,29 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
 {
    std::unique_lock<std::mutex> acquire_lock(m_image_acquire_lock);
 
-   TRY(wait_for_free_buffer(timeout));
+   VkResult wait_result = wait_for_free_buffer(timeout);
+   if (wait_result != VK_SUCCESS)
+   {
+      WSI_LOG_ERROR("AcquireNextImage: wait_for_free_buffer failed with result %d (timeout=%llu)", wait_result,
+                    static_cast<unsigned long long>(timeout));
+      return wait_result;
+   }
    if (error_has_occured())
    {
-      return get_error_state();
+      const VkResult error_state = get_error_state();
+      WSI_LOG_ERROR("AcquireNextImage: swapchain in error state %d", error_state);
+      return error_state;
    }
 
    std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
 
-   size_t i;
-   for (i = 0; i < m_swapchain_images.size(); ++i)
+   const size_t image_count = m_swapchain_images.size();
+   const size_t start_index = image_count > 0 ? (m_next_image_index_hint % image_count) : 0;
+
+   size_t selected_index = image_count;
+   for (size_t attempt = 0; attempt < image_count; ++attempt)
    {
+      const size_t i = (start_index + attempt) % image_count;
       if (m_swapchain_images[i].status == swapchain_image::UNALLOCATED)
       {
          auto res = allocate_and_bind_swapchain_image(m_image_create_info, m_swapchain_images[i]);
@@ -447,11 +462,16 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
       {
          m_swapchain_images[i].status = swapchain_image::ACQUIRED;
          *image_index = i;
+         selected_index = i;
          break;
       }
    }
 
-   assert(i < m_swapchain_images.size());
+   assert(selected_index < image_count);
+   if (image_count > 0)
+   {
+      m_next_image_index_hint = static_cast<uint32_t>((selected_index + 1) % image_count);
+   }
 
    image_status_lock.unlock();
 
@@ -743,6 +763,7 @@ void swapchain_base::clear_descendant()
 
 VkResult swapchain_base::wait_for_free_buffer(uint64_t timeout)
 {
+   const uint64_t original_timeout = timeout;
    VkResult retval;
    /* first see if a buffer is already marked as free */
    retval = m_free_image_semaphore.wait(0);
@@ -758,6 +779,11 @@ VkResult swapchain_base::wait_for_free_buffer(uint64_t timeout)
          /* the sub-implementation has done it's thing, so re-check the
           * semaphore */
          retval = m_free_image_semaphore.wait(timeout);
+         if (retval == VK_NOT_READY && timeout == 0 && original_timeout == UINT64_MAX)
+         {
+            /* Race: backend observed a free image just before semaphore post. */
+            retval = m_free_image_semaphore.wait(UINT64_MAX);
+         }
       }
    }
 

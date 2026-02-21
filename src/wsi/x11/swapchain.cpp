@@ -29,6 +29,7 @@
  */
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -39,8 +40,10 @@
 #include <thread>
 
 #include <dlfcn.h>
+#include <drm_fourcc.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "../layer_utils/timed_semaphore.hpp"
 #include <vulkan/vulkan_core.h>
@@ -57,6 +60,7 @@
 #include "wsi/swapchain_base.hpp"
 #include "wsi/extensions/present_id.hpp"
 #include "shm_presenter.hpp"
+#include "xwayland_dmabuf_bridge.hpp"
 
 namespace wsi
 {
@@ -64,6 +68,26 @@ namespace x11
 {
 
 #define X11_SWAPCHAIN_MAX_PENDING_COMPLETIONS 128
+
+static VkResult fill_image_create_info(VkImageCreateInfo &image_create_info,
+                                       util::vector<VkSubresourceLayout> &image_plane_layouts,
+                                       VkImageDrmFormatModifierExplicitCreateInfoEXT &drm_mod_info,
+                                       VkExternalMemoryImageCreateInfoKHR &external_info, x11_image_data &image_data,
+                                       uint64_t modifier)
+{
+   TRY_LOG_CALL(image_data.external_mem.fill_image_plane_layouts(image_plane_layouts));
+
+   if (image_data.external_mem.is_disjoint())
+   {
+      image_create_info.flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+   }
+
+   image_data.external_mem.fill_drm_mod_info(image_create_info.pNext, drm_mod_info, image_plane_layouts, modifier);
+   image_data.external_mem.fill_external_info(external_info, &drm_mod_info);
+   image_create_info.pNext = &external_info;
+   image_create_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   return VK_SUCCESS;
+}
 
 swapchain::swapchain(wsi::device_private_data &dev_data, const VkAllocationCallbacks *pAllocator,
                      surface &wsi_surface)
@@ -101,6 +125,20 @@ swapchain::~swapchain()
 
    thread_status_lock.unlock();
 
+   if (m_use_xwayland_bridge)
+   {
+      while (!m_bridge_pending_unpresent.empty())
+      {
+         unpresent_image(m_bridge_pending_unpresent.front());
+         m_bridge_pending_unpresent.pop_front();
+      }
+   }
+
+   if (m_xwayland_bridge)
+   {
+      m_xwayland_bridge->stop_stream(m_window);
+   }
+
    /* Call the base's teardown */
    teardown();
 }
@@ -125,28 +163,38 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
       return VK_ERROR_INITIALIZATION_FAILED;
    }
 
-   try
-   {
-      m_shm_presenter = std::make_unique<shm_presenter>();
+   m_xwayland_bridge = xwayland_dmabuf_bridge_client::create_from_environment();
+   m_use_xwayland_bridge = (m_xwayland_bridge != nullptr) && m_xwayland_bridge->is_enabled();
 
-      if (!m_shm_presenter->is_available(m_connection, m_wsi_surface))
+   if (m_use_xwayland_bridge)
+   {
+      WSI_LOG_INFO("XWL_DMABUF_BRIDGE detected: using Xwayland dmabuf bridge presentation path");
+      init_bridge_present_rate_limit();
+   }
+   else
+   {
+      try
       {
-         WSI_LOG_ERROR("SHM presenter is not available");
+         m_shm_presenter = std::make_unique<shm_presenter>();
+
+         if (!m_shm_presenter->is_available(m_connection, m_wsi_surface))
+         {
+            WSI_LOG_ERROR("SHM presenter is not available");
+            return VK_ERROR_INITIALIZATION_FAILED;
+         }
+
+         VkResult init_result = m_shm_presenter->init(m_connection, m_window, m_wsi_surface);
+         if (init_result != VK_SUCCESS)
+         {
+            WSI_LOG_ERROR("Failed to initialize SHM presenter");
+            return init_result;
+         }
+      }
+      catch (const std::exception &e)
+      {
+         WSI_LOG_ERROR("Exception creating presentation strategy: %s", e.what());
          return VK_ERROR_INITIALIZATION_FAILED;
       }
-
-      VkResult init_result = m_shm_presenter->init(m_connection, m_window, m_wsi_surface);
-      if (init_result != VK_SUCCESS)
-      {
-         WSI_LOG_ERROR("Failed to initialize SHM presenter");
-         return init_result;
-      }
-   }
-   catch (const std::exception &e)
-   {
-      WSI_LOG_ERROR("Exception creating presentation strategy: %s", e.what());
-
-      return VK_ERROR_INITIALIZATION_FAILED;
    }
 
    try
@@ -172,26 +220,115 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
    return VK_SUCCESS;
 }
 
+void swapchain::init_bridge_present_rate_limit()
+{
+   constexpr uint32_t default_fifo_fps = 60;
+   constexpr uint32_t max_supported_fps = 240;
+
+   bool has_env_override = false;
+   uint32_t fps = 0;
+
+   const char *fps_env = std::getenv("XWL_DMABUF_BRIDGE_MAX_FPS");
+   if (fps_env && fps_env[0] != '\0')
+   {
+      has_env_override = true;
+      errno = 0;
+      char *end = nullptr;
+      unsigned long parsed = std::strtoul(fps_env, &end, 10);
+
+      if (errno != 0 || end == fps_env || *end != '\0')
+      {
+         WSI_LOG_WARNING("Xwayland bridge: invalid XWL_DMABUF_BRIDGE_MAX_FPS='%s', using default pacing.", fps_env);
+      }
+      else if (parsed > max_supported_fps)
+      {
+         fps = max_supported_fps;
+      }
+      else
+      {
+         fps = static_cast<uint32_t>(parsed);
+      }
+   }
+
+   if (!has_env_override)
+   {
+      /* FIFO-like modes must be paced to avoid flooding bridge imports and stalling desktop compositors. */
+      if (m_present_mode == VK_PRESENT_MODE_FIFO_KHR || m_present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+          m_present_mode == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR ||
+          m_present_mode == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR)
+      {
+         fps = default_fifo_fps;
+      }
+   }
+
+   if (fps == 0)
+   {
+      m_bridge_present_interval_ns = 0;
+      m_bridge_present_rate_limit_initialized = false;
+      if (has_env_override)
+      {
+         WSI_LOG_INFO("Xwayland bridge: present pacing disabled (XWL_DMABUF_BRIDGE_MAX_FPS=0).");
+      }
+      return;
+   }
+
+   m_bridge_present_interval_ns = 1000000000ull / fps;
+   m_bridge_next_present_time = std::chrono::steady_clock::now();
+   m_bridge_present_rate_limit_initialized = true;
+   WSI_LOG_INFO("Xwayland bridge: present pacing enabled at %u FPS", fps);
+}
+
+void swapchain::throttle_bridge_present_if_needed()
+{
+   if (!m_use_xwayland_bridge || m_bridge_present_interval_ns == 0)
+   {
+      return;
+   }
+
+   if (!m_bridge_present_rate_limit_initialized)
+   {
+      m_bridge_next_present_time = std::chrono::steady_clock::now();
+      m_bridge_present_rate_limit_initialized = true;
+      return;
+   }
+
+   const auto interval = std::chrono::nanoseconds(m_bridge_present_interval_ns);
+   const auto now = std::chrono::steady_clock::now();
+   if (now < m_bridge_next_present_time)
+   {
+      std::this_thread::sleep_until(m_bridge_next_present_time);
+   }
+
+   const auto after_wait = std::chrono::steady_clock::now();
+   m_bridge_next_present_time = after_wait + interval;
+}
+
 VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info,
                                                    util::vector<wsialloc_format> &importable_formats,
                                                    util::vector<uint64_t> &exportable_modifers,
-                                                   util::vector<VkDrmFormatModifierPropertiesEXT> &drm_format_props)
+                                                   util::vector<VkDrmFormatModifierPropertiesEXT> &drm_format_props,
+                                                   bool require_drm_display_support)
 {
    TRY_LOG(util::get_drm_format_properties(m_device_data.physical_device, info.format, drm_format_props),
            "Failed to get format properties");
 
-   auto &display = drm_display::get_display();
-   if (!display.has_value())
+   std::optional<drm_display> *display = nullptr;
+   if (require_drm_display_support)
    {
-      WSI_LOG_ERROR("DRM display not available.");
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+      auto &display_ref = drm_display::get_display();
+      if (!display_ref.has_value())
+      {
+         WSI_LOG_ERROR("DRM display not available.");
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      display = &display_ref;
    }
 
    for (const auto &prop : drm_format_props)
    {
       drm_format_pair drm_format{ util::drm::vk_to_drm_format(info.format), prop.drmFormatModifier };
 
-      if (!display->is_format_supported(drm_format))
+      if (require_drm_display_support && !display->value().is_format_supported(drm_format))
       {
          continue;
       }
@@ -380,6 +517,27 @@ VkResult swapchain::allocate_and_bind_swapchain_image(VkImageCreateInfo image_cr
    assert(image.data != nullptr);
    auto image_data = static_cast<x11_image_data *>(image.data);
 
+   if (m_use_xwayland_bridge)
+   {
+      image_data->width = image_create_info.extent.width;
+      image_data->height = image_create_info.extent.height;
+      TRY_LOG(allocate_image(m_image_create_info, image_data), "Failed to allocate image");
+      image_status_lock.unlock();
+
+      TRY_LOG(image_data->external_mem.import_memory_and_bind_swapchain_image(image.image),
+              "Failed to import memory and bind swapchain image");
+
+      /* Initialize presentation fence. */
+      auto present_fence = sync_fd_fence_sync::create(m_device_data);
+      if (!present_fence.has_value())
+      {
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      image_data->present_fence = std::move(present_fence.value());
+
+      return VK_SUCCESS;
+   }
+
    image_status_lock.unlock();
 
    uint32_t width = image_create_info.extent.width;
@@ -391,7 +549,7 @@ VkResult swapchain::allocate_and_bind_swapchain_image(VkImageCreateInfo image_cr
    {
       WSI_LOG_WARNING("Could not get surface depth, using default: %d", depth);
    }
-   
+
    TRY_LOG(m_shm_presenter->create_image_resources(image_data, width, height, depth),
            "Failed to create presentation image resources");
 
@@ -418,6 +576,132 @@ VkResult swapchain::create_swapchain_image(VkImageCreateInfo image_create_info, 
    image_data->device = m_device;
    image_data->device_data = &m_device_data;
 
+   if (m_use_xwayland_bridge)
+   {
+      if (m_image_create_info.format == VK_FORMAT_UNDEFINED)
+      {
+         util::vector<wsialloc_format> importable_formats(
+            util::allocator(m_allocator, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+         util::vector<uint64_t> exportable_modifiers(util::allocator(m_allocator, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+
+         util::vector<VkDrmFormatModifierPropertiesEXT> drm_format_props(
+            util::allocator(m_allocator, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+
+         TRY_LOG_CALL(
+            get_surface_compatible_formats(image_create_info, importable_formats, exportable_modifiers, drm_format_props,
+                                           false));
+
+         if (importable_formats.empty())
+         {
+            WSI_LOG_ERROR("No importable dmabuf formats available for Xwayland bridge path.");
+            return VK_ERROR_INITIALIZATION_FAILED;
+         }
+
+         WSI_LOG_INFO("Xwayland bridge: importable dmabuf candidates=%zu", importable_formats.size());
+         constexpr size_t max_logged_candidates = 8;
+         for (size_t idx = 0; idx < importable_formats.size() && idx < max_logged_candidates; ++idx)
+         {
+            const auto &candidate = importable_formats[idx];
+            WSI_LOG_INFO("Xwayland bridge: candidate[%zu] fourcc=0x%x modifier=0x%llx", idx, candidate.fourcc,
+                         static_cast<unsigned long long>(candidate.modifier));
+         }
+         if (importable_formats.size() > max_logged_candidates)
+         {
+            WSI_LOG_INFO("Xwayland bridge: ... %zu more candidates not shown",
+                         importable_formats.size() - max_logged_candidates);
+         }
+
+         wsialloc_format allocated_format = { 0, 0, 0 };
+         const char *prefer_linear_env = std::getenv("XWL_DMABUF_BRIDGE_PREFER_LINEAR");
+         const bool prefer_linear = prefer_linear_env && !(prefer_linear_env[0] == '0' && prefer_linear_env[1] == '\0');
+
+         bool forced_linear = false;
+         bool preferred_non_linear = false;
+         if (prefer_linear)
+         {
+            auto linear_it = std::find_if(importable_formats.begin(), importable_formats.end(),
+                                          [](const wsialloc_format &fmt) { return fmt.modifier == DRM_FORMAT_MOD_LINEAR; });
+            if (linear_it != importable_formats.end())
+            {
+               util::vector<wsialloc_format> linear_only(
+                  util::allocator(m_allocator, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+               if (!linear_only.try_push_back(*linear_it))
+               {
+                  return VK_ERROR_OUT_OF_HOST_MEMORY;
+               }
+               TRY_LOG_CALL(allocate_wsialloc(image_create_info, image_data, linear_only, &allocated_format, true));
+               forced_linear = true;
+            }
+            else
+            {
+               WSI_LOG_WARNING("Xwayland bridge: DRM_FORMAT_MOD_LINEAR unavailable, falling back to allocator default.");
+               TRY_LOG_CALL(allocate_wsialloc(image_create_info, image_data, importable_formats, &allocated_format, true));
+            }
+         }
+         else
+         {
+            util::vector<wsialloc_format> non_linear_formats(
+               util::allocator(m_allocator, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+
+            for (const auto &fmt : importable_formats)
+            {
+               if (fmt.modifier == DRM_FORMAT_MOD_LINEAR)
+               {
+                  continue;
+               }
+               if (!non_linear_formats.try_push_back(fmt))
+               {
+                  return VK_ERROR_OUT_OF_HOST_MEMORY;
+               }
+            }
+
+            if (!non_linear_formats.empty())
+            {
+               TRY_LOG_CALL(allocate_wsialloc(image_create_info, image_data, non_linear_formats, &allocated_format, true));
+               preferred_non_linear = true;
+            }
+            else
+            {
+               WSI_LOG_WARNING(
+                  "Xwayland bridge: non-linear modifiers unavailable, falling back to allocator default (may pick linear).");
+               TRY_LOG_CALL(allocate_wsialloc(image_create_info, image_data, importable_formats, &allocated_format, true));
+            }
+         }
+
+         WSI_LOG_INFO("Xwayland bridge: selected dmabuf fourcc=0x%x modifier=0x%llx%s%s",
+                      allocated_format.fourcc, static_cast<unsigned long long>(allocated_format.modifier),
+                      forced_linear ? " (linear forced)" : "",
+                      preferred_non_linear ? " (non-linear preferred)" : "");
+         if (allocated_format.fourcc == DRM_FORMAT_ARGB8888)
+         {
+            WSI_LOG_INFO("Xwayland bridge: presentation fourcc remap enabled 0x%x -> 0x%x",
+                         DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888);
+         }
+         else if (allocated_format.fourcc == DRM_FORMAT_ABGR8888)
+         {
+            WSI_LOG_INFO("Xwayland bridge: presentation fourcc remap enabled 0x%x -> 0x%x",
+                         DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888);
+         }
+
+         for (auto &prop : drm_format_props)
+         {
+            if (prop.drmFormatModifier == allocated_format.modifier)
+            {
+               image_data->external_mem.set_num_memories(prop.drmFormatModifierPlaneCount);
+            }
+         }
+
+         TRY_LOG_CALL(fill_image_create_info(
+            image_create_info, m_image_creation_parameters.m_image_layout, m_image_creation_parameters.m_drm_mod_info,
+            m_image_creation_parameters.m_external_info, *image_data, allocated_format.modifier));
+
+         m_image_create_info = image_create_info;
+         m_image_creation_parameters.m_allocated_format = allocated_format;
+      }
+
+      return m_device_data.disp.CreateImage(m_device, &m_image_create_info, get_allocation_callbacks(), &image.image);
+   }
+
    if (m_shm_presenter)
    {
       VkMemoryPropertyFlags optimal = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
@@ -432,10 +716,8 @@ VkResult swapchain::create_swapchain_image(VkImageCreateInfo image_create_info, 
 
       return image_data->external_mem.allocate_and_bind_image(image.image, image_create_info);
    }
-   else
-   {
-      return allocate_image(image_create_info, image_data);
-   }
+
+   return allocate_image(image_create_info, image_data);
 }
 
 void swapchain::present_event_thread()
@@ -503,10 +785,74 @@ void swapchain::present_image(const pending_present_request &pending_present)
    m_send_sbc++;
    uint32_t serial = (uint32_t)m_send_sbc;
 
-   VkResult present_result = m_shm_presenter->present_image(image_data, serial);
+   VkResult present_result = VK_SUCCESS;
+   if (m_use_xwayland_bridge)
+   {
+      auto &external_mem = image_data->external_mem;
+      uint32_t bridge_fourcc = m_image_creation_parameters.m_allocated_format.fourcc;
+      if (bridge_fourcc == DRM_FORMAT_ARGB8888)
+      {
+         bridge_fourcc = DRM_FORMAT_XRGB8888;
+      }
+      else if (bridge_fourcc == DRM_FORMAT_ABGR8888)
+      {
+         bridge_fourcc = DRM_FORMAT_XBGR8888;
+      }
+
+      const auto &offsets = external_mem.get_offsets();
+      const auto &strides = external_mem.get_strides();
+      const auto &fds = external_mem.get_buffer_fds();
+      for (uint32_t plane = 0; plane < external_mem.get_num_planes(); ++plane)
+      {
+         const int plane_fd = fds[plane];
+         const uint64_t required_size = static_cast<uint64_t>(offsets[plane]) +
+                                        static_cast<uint64_t>(strides[plane]) * image_data->height;
+
+         struct stat fd_stat = {};
+         if (plane_fd < 0 || fstat(plane_fd, &fd_stat) != 0)
+         {
+            WSI_LOG_WARNING("Xwayland bridge: plane[%u] fd=%d stat failed (required_size=%llu): %s", plane, plane_fd,
+                            static_cast<unsigned long long>(required_size), strerror(errno));
+            continue;
+         }
+
+         WSI_LOG_DEBUG("Xwayland bridge: plane[%u] fd=%d offset=%u stride=%d height=%u required_size=%llu fd_size=%llu",
+                       plane, plane_fd, offsets[plane], strides[plane], image_data->height,
+                       static_cast<unsigned long long>(required_size),
+                       static_cast<unsigned long long>(fd_stat.st_size));
+         if (required_size > static_cast<uint64_t>(fd_stat.st_size))
+         {
+            WSI_LOG_WARNING("Xwayland bridge: plane[%u] required_size (%llu) exceeds fd_size (%llu)", plane,
+                            static_cast<unsigned long long>(required_size),
+                            static_cast<unsigned long long>(fd_stat.st_size));
+         }
+      }
+
+      const bool bridge_ok =
+         m_xwayland_bridge &&
+         m_xwayland_bridge->present_frame(static_cast<uint32_t>(m_window), image_data->width, image_data->height,
+                                          bridge_fourcc,
+                                          m_image_creation_parameters.m_allocated_format.modifier,
+                                          external_mem.get_num_planes(), offsets.data(), strides.data(), fds.data());
+
+      if (!bridge_ok)
+      {
+         WSI_LOG_WARNING("Xwayland bridge submit failed: window=0x%x image=%u size=%ux%u format=0x%x modifier=0x%llx",
+                         static_cast<unsigned>(m_window), pending_present.image_index, image_data->width,
+                         image_data->height, bridge_fourcc,
+                         static_cast<unsigned long long>(m_image_creation_parameters.m_allocated_format.modifier));
+         present_result = VK_ERROR_SURFACE_LOST_KHR;
+         set_error_state(VK_ERROR_SURFACE_LOST_KHR);
+      }
+   }
+   else
+   {
+      present_result = m_shm_presenter->present_image(image_data, serial);
+   }
+
    if (present_result != VK_SUCCESS)
    {
-      WSI_LOG_ERROR("Failed to present image using presentation strategy: %d", present_result);
+      WSI_LOG_ERROR("Failed to present image on X11 swapchain path: %d", present_result);
    }
 
    if (m_device_data.is_present_id_enabled())
@@ -518,21 +864,55 @@ void swapchain::present_image(const pending_present_request &pending_present)
    uint32_t image_index_to_unpresent = 0;
    bool should_unpresent = false;
 
-   if (present_result == VK_SUCCESS)
+   if (!m_use_xwayland_bridge)
    {
       image_index_to_unpresent = pending_present.image_index;
       should_unpresent = true;
+   }
+   else if (present_result == VK_SUCCESS)
+   {
+      /*
+       * Do not release the just-submitted image immediately on bridge path.
+       * Keep a small in-flight queue so we do not render into a buffer that
+       * may still be sampled by the compositor.
+       */
+      const size_t release_lag_frames = (m_swapchain_images.size() >= 3) ? 2u : 1u;
+      if (!m_bridge_release_lag_logged)
+      {
+         WSI_LOG_INFO("Xwayland bridge: delayed image release enabled (lag=%zu frame%s)", release_lag_frames,
+                      (release_lag_frames == 1) ? "" : "s");
+         m_bridge_release_lag_logged = true;
+      }
+      m_bridge_pending_unpresent.push_back(pending_present.image_index);
+
+      while (m_bridge_pending_unpresent.size() > release_lag_frames)
+      {
+         const uint32_t completed_index = m_bridge_pending_unpresent.front();
+         m_bridge_pending_unpresent.pop_front();
+         unpresent_image(completed_index);
+      }
    }
    else
    {
       WSI_LOG_ERROR("Present failed with result %d, performing immediate cleanup", present_result);
       image_index_to_unpresent = pending_present.image_index;
       should_unpresent = true;
+
+      while (!m_bridge_pending_unpresent.empty())
+      {
+         unpresent_image(m_bridge_pending_unpresent.front());
+         m_bridge_pending_unpresent.pop_front();
+      }
    }
 
    m_thread_status_cond.notify_all();
 
    thread_status_lock.unlock();
+
+   if (m_use_xwayland_bridge && present_result == VK_SUCCESS)
+   {
+      throttle_bridge_present_if_needed();
+   }
 
    if (should_unpresent)
    {

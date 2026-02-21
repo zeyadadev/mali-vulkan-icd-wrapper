@@ -1,0 +1,963 @@
+diff --git a/hw/xwayland/DMABUF_BRIDGE.md b/hw/xwayland/DMABUF_BRIDGE.md
+new file mode 100644
+index 00000000..7cfb05e1
+--- /dev/null
++++ b/hw/xwayland/DMABUF_BRIDGE.md
+@@ -0,0 +1,64 @@
++# Xwayland dmabuf bridge (PoC)
++
++This patch adds an optional out-of-band dmabuf bridge for Xwayland.
++
++- Enable it with `XWL_DMABUF_BRIDGE=/path/to/socket`
++- Xwayland creates a `SOCK_SEQPACKET` UNIX socket at that path
++- A helper process can connect, send frame metadata, and pass dmabuf FDs via `SCM_RIGHTS`
++- Xwayland imports the dmabuf as a `wl_buffer` and commits directly to the existing `wl_surface` for the target X11 window
++
++## Packet ABI (`version = 1`)
++
++Defined in `xwayland-dmabuf-bridge.h`:
++
++```c
++#define XWL_DMABUF_BRIDGE_MAGIC 0x58444246u
++#define XWL_DMABUF_BRIDGE_VERSION 1
++#define XWL_DMABUF_BRIDGE_MAX_PLANES 4
++
++enum xwl_dmabuf_bridge_opcode {
++    XWL_DMABUF_BRIDGE_OP_FRAME = 1,
++    XWL_DMABUF_BRIDGE_OP_STOP = 2,
++};
++
++struct xwl_dmabuf_bridge_plane {
++    uint32_t offset;
++    uint32_t stride;
++    uint32_t modifier_hi;
++    uint32_t modifier_lo;
++};
++
++struct xwl_dmabuf_bridge_packet {
++    uint32_t magic;
++    uint16_t version;
++    uint16_t opcode;
++    uint32_t xid;
++    uint32_t width;
++    uint32_t height;
++    uint32_t format;
++    uint32_t flags;
++    uint32_t num_planes;
++    uint32_t reserved;
++    struct xwl_dmabuf_bridge_plane planes[XWL_DMABUF_BRIDGE_MAX_PLANES];
++};
++```
++
++For `XWL_DMABUF_BRIDGE_OP_FRAME`:
++- send one packet plus `num_planes` dmabuf FDs in the same `sendmsg()`
++- FD order must match plane index `0..num_planes-1`
++- `format` is the DRM fourcc used by `zwp_linux_dmabuf_v1`
++
++For `XWL_DMABUF_BRIDGE_OP_STOP`:
++- no FDs required
++- Xwayland clears the per-window external streaming flag for `xid`
++
++## Behavior
++
++- Imported frames are committed directly on `xwl_window->surface`
++- The normal internal damage post path is skipped while a window is in external streaming mode
++- `xid` must be a valid X11 `Window` on the running Xwayland server
++
++## Notes
++
++- This is a PoC transport and import path (no explicit completion/retire ACK yet)
++- For production usage, add a small return channel for release notifications and backpressure
+diff --git a/hw/xwayland/meson.build b/hw/xwayland/meson.build
+index 54529b64..4e1a71e1 100644
+--- a/hw/xwayland/meson.build
++++ b/hw/xwayland/meson.build
+@@ -4,6 +4,8 @@ srcs = [
+     'xwayland-input.h',
+     'xwayland-cursor.c',
+     'xwayland-cursor.h',
++    'xwayland-dmabuf-bridge.c',
++    'xwayland-dmabuf-bridge.h',
+     'xwayland-drm-lease.h',
+     'xwayland-drm-lease.c',
+     'xwayland-glamor.h',
+diff --git a/hw/xwayland/xwayland-dmabuf-bridge.c b/hw/xwayland/xwayland-dmabuf-bridge.c
+new file mode 100644
+index 00000000..59a0b9c4
+--- /dev/null
++++ b/hw/xwayland/xwayland-dmabuf-bridge.c
+@@ -0,0 +1,715 @@
++/*
++ * Copyright © 2026
++ *
++ * Permission to use, copy, modify, distribute, and sell this software
++ * and its documentation for any purpose is hereby granted without
++ * fee, provided that the above copyright notice appear in all copies
++ * and that both that copyright notice and this permission notice
++ * appear in supporting documentation, and that the name of the
++ * copyright holders not be used in advertising or publicity
++ * pertaining to distribution of the software without specific,
++ * written prior permission.  The copyright holders make no
++ * representations about the suitability of this software for any
++ * purpose.  It is provided "as is" without express or implied
++ * warranty.
++ *
++ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++ * FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
++ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
++ * SOFTWARE.
++ */
++
++#include <xwayland-config.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <dix.h>
++#include <os.h>
++
++#include "xwayland-dmabuf-bridge.h"
++#include "xwayland-glamor.h"
++#include "xwayland-screen.h"
++#include "xwayland-window.h"
++
++#include "linux-dmabuf-unstable-v1-client-protocol.h"
++
++#define XWL_DMABUF_BRIDGE_BACKLOG 16
++#define XWL_DMABUF_BRIDGE_MOD_INVALID 0x00ffffffffffffffULL
++
++struct xwl_dmabuf_bridge_client {
++    struct xorg_list link;
++    struct xwl_screen *xwl_screen;
++    int fd;
++};
++
++struct xwl_dmabuf_bridge {
++    int listener_fd;
++    char socket_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
++    struct xorg_list clients;
++};
++
++struct xwl_dmabuf_bridge_buffer {
++    int dummy;
++};
++
++struct xwl_dmabuf_bridge_pending_frame {
++    struct xwl_screen *xwl_screen;
++    XID xid;
++    uint32_t width;
++    uint32_t height;
++    uint32_t format;
++    uint64_t modifier;
++    uint32_t num_planes;
++    struct xwl_dmabuf_bridge_plane planes[XWL_DMABUF_BRIDGE_MAX_PLANES];
++    int fds[XWL_DMABUF_BRIDGE_MAX_PLANES];
++    Bool retry_implicit;
++};
++
++static void
++xwl_dmabuf_bridge_close_fds(int *fds, size_t num_fds)
++{
++    size_t i;
++
++    for (i = 0; i < num_fds; i++) {
++        if (fds[i] >= 0)
++            close(fds[i]);
++    }
++}
++
++static void
++xwl_dmabuf_bridge_pending_frame_destroy(struct xwl_dmabuf_bridge_pending_frame *pending)
++{
++    if (!pending)
++        return;
++
++    xwl_dmabuf_bridge_close_fds(pending->fds, pending->num_planes);
++    free(pending);
++}
++
++static Bool
++xwl_dmabuf_bridge_set_nonblocking_cloexec(int fd)
++{
++    int flags;
++
++    flags = fcntl(fd, F_GETFL);
++    if (flags < 0)
++        return FALSE;
++    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
++        return FALSE;
++
++    flags = fcntl(fd, F_GETFD);
++    if (flags < 0)
++        return FALSE;
++    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
++        return FALSE;
++
++    return TRUE;
++}
++
++static int
++xwl_dmabuf_bridge_listen_socket(const char *socket_path)
++{
++    struct sockaddr_un addr;
++    int fd;
++
++    fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
++    if (fd < 0) {
++        ErrorF("xwayland dmabuf bridge: socket() failed: %s\n",
++               strerror(errno));
++        return -1;
++    }
++
++    if (!xwl_dmabuf_bridge_set_nonblocking_cloexec(fd)) {
++        ErrorF("xwayland dmabuf bridge: failed to configure socket: %s\n",
++               strerror(errno));
++        close(fd);
++        return -1;
++    }
++
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
++
++    unlink(socket_path);
++
++    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
++        ErrorF("xwayland dmabuf bridge: bind(%s) failed: %s\n",
++               socket_path, strerror(errno));
++        close(fd);
++        return -1;
++    }
++
++    if (listen(fd, XWL_DMABUF_BRIDGE_BACKLOG) < 0) {
++        ErrorF("xwayland dmabuf bridge: listen(%s) failed: %s\n",
++               socket_path, strerror(errno));
++        close(fd);
++        unlink(socket_path);
++        return -1;
++    }
++
++    return fd;
++}
++
++static void
++xwl_dmabuf_bridge_buffer_release(void *data, struct wl_buffer *buffer)
++{
++    struct xwl_dmabuf_bridge_buffer *bridge_buffer = data;
++
++    wl_buffer_destroy(buffer);
++    free(bridge_buffer);
++}
++
++static const struct wl_buffer_listener xwl_dmabuf_bridge_buffer_listener = {
++    .release = xwl_dmabuf_bridge_buffer_release,
++};
++
++static struct xwl_window *
++xwl_dmabuf_bridge_window_for_xid(struct xwl_screen *xwl_screen, XID xid);
++
++static Bool
++xwl_dmabuf_bridge_commit_buffer(struct xwl_screen *xwl_screen, XID xid,
++                                struct wl_buffer *buffer,
++                                uint32_t width, uint32_t height)
++{
++    struct xwl_dmabuf_bridge_buffer *bridge_buffer;
++    struct xwl_window *xwl_window;
++
++    xwl_window = xwl_dmabuf_bridge_window_for_xid(xwl_screen, xid);
++    if (!xwl_window) {
++        wl_buffer_destroy(buffer);
++        return FALSE;
++    }
++
++    bridge_buffer = calloc(1, sizeof(*bridge_buffer));
++    if (!bridge_buffer) {
++        wl_buffer_destroy(buffer);
++        return FALSE;
++    }
++
++    wl_buffer_add_listener(buffer,
++                           &xwl_dmabuf_bridge_buffer_listener,
++                           bridge_buffer);
++
++    if (xwl_screen->prepare_read) {
++        wl_display_cancel_read(xwl_screen->display);
++        xwl_screen->prepare_read = 0;
++    }
++
++    xwl_window->external_dmabuf_stream = TRUE;
++    xorg_list_del(&xwl_window->link_damage);
++
++    wl_surface_attach(xwl_window->surface, buffer, 0, 0);
++    xwl_surface_damage(xwl_screen, xwl_window->surface, 0, 0, width, height);
++    wl_surface_commit(xwl_window->surface);
++
++    if (wl_display_flush(xwl_screen->display) < 0 && errno != EAGAIN)
++        ErrorF("xwayland dmabuf bridge: wl_display_flush failed: %s\n",
++               strerror(errno));
++
++    return TRUE;
++}
++
++static const struct zwp_linux_buffer_params_v1_listener
++xwl_dmabuf_bridge_params_listener;
++
++static void
++xwl_dmabuf_bridge_params_created(void *data,
++                                 struct zwp_linux_buffer_params_v1 *params,
++                                 struct wl_buffer *buffer)
++{
++    struct xwl_dmabuf_bridge_pending_frame *pending = data;
++
++    if (!pending) {
++        wl_buffer_destroy(buffer);
++        goto out;
++    }
++
++    if (!xwl_dmabuf_bridge_commit_buffer(pending->xwl_screen, pending->xid,
++                                         buffer, pending->width,
++                                         pending->height)) {
++        ErrorF("xwayland dmabuf bridge: failed to commit created buffer xid=0x%x size=%ux%u format=0x%08x modifier=0x%016llx\n",
++               pending->xid, pending->width, pending->height, pending->format,
++               (unsigned long long) pending->modifier);
++    }
++
++out:
++    zwp_linux_buffer_params_v1_destroy(params);
++    xwl_dmabuf_bridge_pending_frame_destroy(pending);
++}
++
++static void
++xwl_dmabuf_bridge_params_failed(void *data,
++                                struct zwp_linux_buffer_params_v1 *params)
++{
++    struct xwl_dmabuf_bridge_pending_frame *pending = data;
++
++    if (pending && !pending->retry_implicit && pending->modifier == 0) {
++        struct zwp_linux_buffer_params_v1 *retry_params;
++        const uint32_t mod_hi = (uint32_t) (XWL_DMABUF_BRIDGE_MOD_INVALID >> 32);
++        const uint32_t mod_lo = (uint32_t) (XWL_DMABUF_BRIDGE_MOD_INVALID & 0xffffffffu);
++        uint32_t i;
++
++        pending->retry_implicit = TRUE;
++        retry_params = zwp_linux_dmabuf_v1_create_params(pending->xwl_screen->dmabuf);
++        if (retry_params &&
++            zwp_linux_buffer_params_v1_add_listener(retry_params,
++                                                    &xwl_dmabuf_bridge_params_listener,
++                                                    pending) == 0) {
++            ErrorF("xwayland dmabuf bridge: retrying linear import with implicit modifier xid=0x%x format=0x%08x\n",
++                   pending->xid, pending->format);
++
++            for (i = 0; i < pending->num_planes; i++) {
++                const struct xwl_dmabuf_bridge_plane *plane = &pending->planes[i];
++
++                zwp_linux_buffer_params_v1_add(retry_params,
++                                               pending->fds[i],
++                                               i,
++                                               plane->offset,
++                                               plane->stride,
++                                               mod_hi,
++                                               mod_lo);
++            }
++
++            pending->modifier = XWL_DMABUF_BRIDGE_MOD_INVALID;
++            zwp_linux_buffer_params_v1_create(retry_params, pending->width,
++                                              pending->height, pending->format, 0);
++            if (wl_display_flush(pending->xwl_screen->display) >= 0 || errno == EAGAIN) {
++                zwp_linux_buffer_params_v1_destroy(params);
++                return;
++            }
++
++            ErrorF("xwayland dmabuf bridge: retry wl_display_flush failed: %s\n",
++                   strerror(errno));
++        }
++
++        if (retry_params)
++            zwp_linux_buffer_params_v1_destroy(retry_params);
++    }
++
++    if (pending) {
++        ErrorF("xwayland dmabuf bridge: compositor rejected dmabuf xid=0x%x size=%ux%u format=0x%08x modifier=0x%016llx planes=%u p0_offset=%u p0_stride=%u\n",
++               pending->xid, pending->width, pending->height, pending->format,
++               (unsigned long long) pending->modifier, pending->num_planes,
++               pending->planes[0].offset, pending->planes[0].stride);
++    } else {
++        ErrorF("xwayland dmabuf bridge: compositor rejected dmabuf (missing pending state)\n");
++    }
++
++    zwp_linux_buffer_params_v1_destroy(params);
++    xwl_dmabuf_bridge_pending_frame_destroy(pending);
++}
++
++static const struct zwp_linux_buffer_params_v1_listener xwl_dmabuf_bridge_params_listener = {
++    .created = xwl_dmabuf_bridge_params_created,
++    .failed = xwl_dmabuf_bridge_params_failed,
++};
++
++static struct xwl_window *
++xwl_dmabuf_bridge_window_for_xid(struct xwl_screen *xwl_screen, XID xid)
++{
++    WindowPtr window;
++    struct xwl_window *xwl_window;
++    int rc;
++
++    rc = dixLookupWindow(&window, xid, serverClient, DixReadAccess);
++    if (rc != Success) {
++        ErrorF("xwayland dmabuf bridge: window lookup failed xid=0x%x rc=%d\n",
++               xid, rc);
++        return NULL;
++    }
++
++    xwl_window = xwl_window_from_window(window);
++    if (!xwl_window) {
++        ErrorF("xwayland dmabuf bridge: window has no xwl_window xid=0x%x\n",
++               xid);
++        return NULL;
++    }
++
++    if (xwl_window->xwl_screen != xwl_screen) {
++        ErrorF("xwayland dmabuf bridge: screen mismatch xid=0x%x\n", xid);
++        return NULL;
++    }
++
++    if (!xwl_window->surface) {
++        ErrorF("xwayland dmabuf bridge: window has no wl_surface yet xid=0x%x\n",
++               xid);
++        return NULL;
++    }
++
++    return xwl_window;
++}
++
++static Bool
++xwl_dmabuf_bridge_submit_frame(struct xwl_screen *xwl_screen,
++                               const struct xwl_dmabuf_bridge_packet *packet,
++                               int *fds, size_t num_fds)
++{
++    struct xwl_dmabuf_bridge_pending_frame *pending;
++    struct xwl_window *xwl_window;
++    struct zwp_linux_buffer_params_v1 *params;
++    uint64_t modifier;
++    uint32_t i;
++
++    if (!xwl_screen->dmabuf)
++        return FALSE;
++
++    if (packet->width == 0 || packet->height == 0)
++        return FALSE;
++
++    if (packet->num_planes == 0 ||
++        packet->num_planes > XWL_DMABUF_BRIDGE_MAX_PLANES)
++        return FALSE;
++
++    if (packet->num_planes > num_fds)
++        return FALSE;
++
++    xwl_window = xwl_dmabuf_bridge_window_for_xid(xwl_screen, packet->xid);
++    if (!xwl_window)
++        return FALSE;
++
++    modifier = ((uint64_t) packet->planes[0].modifier_hi << 32) |
++               (uint64_t) packet->planes[0].modifier_lo;
++    if (!xwl_glamor_is_modifier_supported(xwl_screen, packet->format, modifier)) {
++        ErrorF("xwayland dmabuf bridge: unsupported format/modifier format=0x%08x modifier=0x%016llx\n",
++               packet->format, (unsigned long long) modifier);
++        return FALSE;
++    }
++
++    if (wl_display_flush(xwl_screen->display) < 0) {
++        if (errno == EAGAIN)
++            return FALSE;
++        ErrorF("xwayland dmabuf bridge: wl_display_flush pre-import failed: %s\n",
++               strerror(errno));
++        return FALSE;
++    }
++
++    params = zwp_linux_dmabuf_v1_create_params(xwl_screen->dmabuf);
++    if (!params)
++        return FALSE;
++
++    pending = calloc(1, sizeof(*pending));
++    if (!pending) {
++        zwp_linux_buffer_params_v1_destroy(params);
++        return FALSE;
++    }
++
++    pending->xwl_screen = xwl_screen;
++    pending->xid = packet->xid;
++    pending->width = packet->width;
++    pending->height = packet->height;
++    pending->format = packet->format;
++    pending->modifier = modifier;
++    pending->num_planes = packet->num_planes;
++    for (i = 0; i < packet->num_planes; i++)
++        pending->planes[i] = packet->planes[i];
++    for (i = 0; i < XWL_DMABUF_BRIDGE_MAX_PLANES; i++)
++        pending->fds[i] = -1;
++    pending->retry_implicit = FALSE;
++
++    for (i = 0; i < packet->num_planes; i++) {
++        pending->fds[i] = dup(fds[i]);
++        if (pending->fds[i] < 0) {
++            ErrorF("xwayland dmabuf bridge: failed to dup plane fd for retry: %s\n",
++                   strerror(errno));
++            zwp_linux_buffer_params_v1_destroy(params);
++            xwl_dmabuf_bridge_pending_frame_destroy(pending);
++            return FALSE;
++        }
++    }
++
++    if (zwp_linux_buffer_params_v1_add_listener(params,
++                                                &xwl_dmabuf_bridge_params_listener,
++                                                pending) < 0) {
++        zwp_linux_buffer_params_v1_destroy(params);
++        xwl_dmabuf_bridge_pending_frame_destroy(pending);
++        return FALSE;
++    }
++
++    for (i = 0; i < packet->num_planes; i++) {
++        const struct xwl_dmabuf_bridge_plane *plane = &packet->planes[i];
++
++        zwp_linux_buffer_params_v1_add(params,
++                                       fds[i],
++                                       i,
++                                       plane->offset,
++                                       plane->stride,
++                                       plane->modifier_hi,
++                                       plane->modifier_lo);
++    }
++
++    zwp_linux_buffer_params_v1_create(params, packet->width, packet->height,
++                                      packet->format, 0);
++    if (wl_display_flush(xwl_screen->display) < 0 && errno != EAGAIN) {
++        ErrorF("xwayland dmabuf bridge: wl_display_flush post-create failed: %s\n",
++               strerror(errno));
++        zwp_linux_buffer_params_v1_destroy(params);
++        xwl_dmabuf_bridge_pending_frame_destroy(pending);
++        return FALSE;
++    }
++
++    return TRUE;
++}
++
++static void
++xwl_dmabuf_bridge_stop_stream(struct xwl_screen *xwl_screen, XID xid)
++{
++    struct xwl_window *xwl_window;
++
++    xwl_window = xwl_dmabuf_bridge_window_for_xid(xwl_screen, xid);
++    if (!xwl_window)
++        return;
++
++    xwl_window->external_dmabuf_stream = FALSE;
++}
++
++static void
++xwl_dmabuf_bridge_client_destroy(struct xwl_dmabuf_bridge_client *client)
++{
++    RemoveNotifyFd(client->fd);
++    close(client->fd);
++    xorg_list_del(&client->link);
++    free(client);
++}
++
++static int
++xwl_dmabuf_bridge_recv_packet(int fd,
++                              struct xwl_dmabuf_bridge_packet *packet,
++                              int *fds, size_t max_fds)
++{
++    union {
++        struct cmsghdr cmsg;
++        char control[CMSG_SPACE(sizeof(int) * XWL_DMABUF_BRIDGE_MAX_PLANES)];
++    } control_un;
++    struct iovec iov;
++    struct msghdr msg;
++    struct cmsghdr *cmsg;
++    ssize_t ret;
++    size_t fd_count = 0;
++
++    memset(packet, 0, sizeof(*packet));
++    memset(fds, -1, sizeof(*fds) * max_fds);
++    memset(&msg, 0, sizeof(msg));
++    memset(&control_un, 0, sizeof(control_un));
++
++    iov.iov_base = packet;
++    iov.iov_len = sizeof(*packet);
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    msg.msg_control = control_un.control;
++    msg.msg_controllen = sizeof(control_un.control);
++
++    ret = recvmsg(fd, &msg, MSG_DONTWAIT);
++    if (ret < 0) {
++        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
++            return -2;
++        return -1;
++    }
++
++    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++        size_t payload_len;
++        size_t i;
++        size_t payload_fds;
++        int *payload;
++
++        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
++            continue;
++
++        if (cmsg->cmsg_len < CMSG_LEN(0))
++            continue;
++
++        payload_len = cmsg->cmsg_len - CMSG_LEN(0);
++        payload_fds = payload_len / sizeof(int);
++        payload = (int *) CMSG_DATA(cmsg);
++
++        for (i = 0; i < payload_fds; i++) {
++            if (fd_count < max_fds)
++                fds[fd_count++] = payload[i];
++            else
++                close(payload[i]);
++        }
++    }
++
++    if (ret == 0)
++        return -3;
++
++    if ((size_t) ret != sizeof(*packet) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
++        xwl_dmabuf_bridge_close_fds(fds, fd_count);
++        errno = EPROTO;
++        return -1;
++    }
++
++    return (int) fd_count;
++}
++
++static void
++xwl_dmabuf_bridge_client_readable(int fd, int ready, void *data)
++{
++    struct xwl_dmabuf_bridge_client *client = data;
++    struct xwl_dmabuf_bridge_packet packet;
++    int fds[XWL_DMABUF_BRIDGE_MAX_PLANES];
++    int fd_count;
++
++    (void) ready;
++
++    fd_count = xwl_dmabuf_bridge_recv_packet(fd, &packet, fds, XWL_DMABUF_BRIDGE_MAX_PLANES);
++    if (fd_count == -2)
++        return;
++
++    if (fd_count == -3) {
++        xwl_dmabuf_bridge_client_destroy(client);
++        return;
++    }
++
++    if (fd_count == -1) {
++        ErrorF("xwayland dmabuf bridge: invalid packet from bridge client: %s\n",
++               strerror(errno));
++        xwl_dmabuf_bridge_client_destroy(client);
++        return;
++    }
++
++    if (packet.magic != XWL_DMABUF_BRIDGE_MAGIC ||
++        packet.version != XWL_DMABUF_BRIDGE_VERSION) {
++        xwl_dmabuf_bridge_close_fds(fds, fd_count);
++        return;
++    }
++
++    switch (packet.opcode) {
++    case XWL_DMABUF_BRIDGE_OP_FRAME:
++        xwl_dmabuf_bridge_submit_frame(client->xwl_screen, &packet,
++                                       fds, fd_count);
++        break;
++    case XWL_DMABUF_BRIDGE_OP_STOP:
++        xwl_dmabuf_bridge_stop_stream(client->xwl_screen, packet.xid);
++        break;
++    default:
++        break;
++    }
++
++    xwl_dmabuf_bridge_close_fds(fds, fd_count);
++}
++
++static void
++xwl_dmabuf_bridge_listener_readable(int fd, int ready, void *data)
++{
++    struct xwl_screen *xwl_screen = data;
++    struct xwl_dmabuf_bridge *bridge = xwl_screen->dmabuf_bridge;
++
++    (void) ready;
++
++    while (1) {
++        struct xwl_dmabuf_bridge_client *client;
++        int client_fd;
++
++        client_fd = accept(fd, NULL, NULL);
++        if (client_fd < 0) {
++            if (errno != EAGAIN && errno != EWOULDBLOCK)
++                ErrorF("xwayland dmabuf bridge: accept() failed: %s\n",
++                       strerror(errno));
++            return;
++        }
++
++        if (!xwl_dmabuf_bridge_set_nonblocking_cloexec(client_fd)) {
++            ErrorF("xwayland dmabuf bridge: failed to configure client socket: %s\n",
++                   strerror(errno));
++            close(client_fd);
++            continue;
++        }
++
++        client = calloc(1, sizeof(*client));
++        if (!client) {
++            close(client_fd);
++            continue;
++        }
++
++        client->xwl_screen = xwl_screen;
++        client->fd = client_fd;
++        xorg_list_append(&client->link, &bridge->clients);
++
++        if (!SetNotifyFd(client_fd, xwl_dmabuf_bridge_client_readable,
++                         X_NOTIFY_READ, client)) {
++            xwl_dmabuf_bridge_client_destroy(client);
++            continue;
++        }
++    }
++}
++
++Bool
++xwl_dmabuf_bridge_init(struct xwl_screen *xwl_screen)
++{
++    struct xwl_dmabuf_bridge *bridge;
++    const char *socket_path;
++    size_t path_len;
++
++    socket_path = getenv("XWL_DMABUF_BRIDGE");
++    if (!socket_path || !socket_path[0])
++        return TRUE;
++
++    path_len = strlen(socket_path);
++    if (path_len >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
++        ErrorF("xwayland dmabuf bridge: path too long: %s\n", socket_path);
++        return TRUE;
++    }
++
++    if (!xwl_screen->dmabuf) {
++        ErrorF("xwayland dmabuf bridge: dmabuf interface unavailable, bridge disabled\n");
++        return TRUE;
++    }
++
++    bridge = calloc(1, sizeof(*bridge));
++    if (!bridge)
++        return FALSE;
++
++    xorg_list_init(&bridge->clients);
++
++    bridge->listener_fd = xwl_dmabuf_bridge_listen_socket(socket_path);
++    if (bridge->listener_fd < 0) {
++        free(bridge);
++        return TRUE;
++    }
++
++    strncpy(bridge->socket_path, socket_path, sizeof(bridge->socket_path) - 1);
++    xwl_screen->dmabuf_bridge = bridge;
++
++    if (!SetNotifyFd(bridge->listener_fd, xwl_dmabuf_bridge_listener_readable,
++                     X_NOTIFY_READ, xwl_screen)) {
++        xwl_dmabuf_bridge_cleanup(xwl_screen);
++        return FALSE;
++    }
++
++    ErrorF("xwayland dmabuf bridge: listening on %s\n", bridge->socket_path);
++    return TRUE;
++}
++
++void
++xwl_dmabuf_bridge_cleanup(struct xwl_screen *xwl_screen)
++{
++    struct xwl_dmabuf_bridge *bridge = xwl_screen->dmabuf_bridge;
++    struct xwl_dmabuf_bridge_client *client, *next_client;
++
++    if (!bridge)
++        return;
++
++    xorg_list_for_each_entry_safe(client, next_client, &bridge->clients, link)
++        xwl_dmabuf_bridge_client_destroy(client);
++
++    RemoveNotifyFd(bridge->listener_fd);
++    close(bridge->listener_fd);
++
++    if (bridge->socket_path[0])
++        unlink(bridge->socket_path);
++
++    free(bridge);
++    xwl_screen->dmabuf_bridge = NULL;
++}
+diff --git a/hw/xwayland/xwayland-dmabuf-bridge.h b/hw/xwayland/xwayland-dmabuf-bridge.h
+new file mode 100644
+index 00000000..4b1d93c1
+--- /dev/null
++++ b/hw/xwayland/xwayland-dmabuf-bridge.h
+@@ -0,0 +1,68 @@
++/*
++ * Copyright © 2026
++ *
++ * Permission to use, copy, modify, distribute, and sell this software
++ * and its documentation for any purpose is hereby granted without
++ * fee, provided that the above copyright notice appear in all copies
++ * and that both that copyright notice and this permission notice
++ * appear in supporting documentation, and that the name of the
++ * copyright holders not be used in advertising or publicity
++ * pertaining to distribution of the software without specific,
++ * written prior permission.  The copyright holders make no
++ * representations about the suitability of this software for any
++ * purpose.  It is provided "as is" without express or implied
++ * warranty.
++ *
++ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++ * FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
++ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
++ * SOFTWARE.
++ */
++
++#ifndef XWAYLAND_DMABUF_BRIDGE_H
++#define XWAYLAND_DMABUF_BRIDGE_H
++
++#include <stdint.h>
++
++#include <dix.h>
++
++#include "xwayland-types.h"
++
++#define XWL_DMABUF_BRIDGE_MAGIC 0x58444246u
++#define XWL_DMABUF_BRIDGE_VERSION 1
++#define XWL_DMABUF_BRIDGE_MAX_PLANES 4
++
++enum xwl_dmabuf_bridge_opcode {
++    XWL_DMABUF_BRIDGE_OP_FRAME = 1,
++    XWL_DMABUF_BRIDGE_OP_STOP = 2,
++};
++
++struct xwl_dmabuf_bridge_plane {
++    uint32_t offset;
++    uint32_t stride;
++    uint32_t modifier_hi;
++    uint32_t modifier_lo;
++};
++
++struct xwl_dmabuf_bridge_packet {
++    uint32_t magic;
++    uint16_t version;
++    uint16_t opcode;
++    uint32_t xid;
++    uint32_t width;
++    uint32_t height;
++    uint32_t format;
++    uint32_t flags;
++    uint32_t num_planes;
++    uint32_t reserved;
++    struct xwl_dmabuf_bridge_plane planes[XWL_DMABUF_BRIDGE_MAX_PLANES];
++};
++
++Bool xwl_dmabuf_bridge_init(struct xwl_screen *xwl_screen);
++void xwl_dmabuf_bridge_cleanup(struct xwl_screen *xwl_screen);
++
++#endif /* XWAYLAND_DMABUF_BRIDGE_H */
+diff --git a/hw/xwayland/xwayland-screen.c b/hw/xwayland/xwayland-screen.c
+index cc14e077..25ae1916 100644
+--- a/hw/xwayland/xwayland-screen.c
++++ b/hw/xwayland/xwayland-screen.c
+@@ -44,6 +44,7 @@
+ #include <xserver_poll.h>
+ 
+ #include "xwayland-cursor.h"
++#include "xwayland-dmabuf-bridge.h"
+ #include "xwayland-screen.h"
+ #include "xwayland-window.h"
+ #include "xwayland-input.h"
+@@ -216,6 +217,8 @@ xwl_close_screen(ScreenPtr screen)
+                                   &xwl_screen->pending_wl_surface_destroy, link)
+         xwl_window_surface_do_destroy(xwl_wl_surface);
+ 
++    xwl_dmabuf_bridge_cleanup(xwl_screen);
++
+     RemoveNotifyFd(xwl_screen->wayland_fd);
+ 
+     wl_display_disconnect(xwl_screen->display);
+@@ -374,6 +377,9 @@ xwl_screen_post_damage(struct xwl_screen *xwl_screen)
+         if (!xwl_window->allow_commits)
+             continue;
+ 
++        if (xwl_window->external_dmabuf_stream)
++            continue;
++
+ #ifdef XWL_HAS_GLAMOR
+         if (xwl_screen->glamor && !xwl_glamor_allow_commits(xwl_window))
+             continue;
+@@ -467,6 +473,10 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id,
+             wl_registry_bind(registry, id, &wp_tearing_control_manager_v1_interface, 1);
+     }
+ #ifdef XWL_HAS_GLAMOR
++    else if (!xwl_screen->glamor &&
++             strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
++        xwl_screen_set_dmabuf_interface(xwl_screen, id, version);
++    }
+     else if (xwl_screen->glamor) {
+         xwl_glamor_init_wl_registry(xwl_screen, registry, id, interface,
+                                     version);
+@@ -947,6 +957,9 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
+     SetNotifyFd(xwl_screen->wayland_fd, socket_handler, X_NOTIFY_READ, xwl_screen);
+     RegisterBlockAndWakeupHandlers(block_handler, wakeup_handler, xwl_screen);
+ 
++    if (!xwl_dmabuf_bridge_init(xwl_screen))
++        return FALSE;
++
+     pScreen->blackPixel = 0;
+     pScreen->whitePixel = 1;
+ 
+diff --git a/hw/xwayland/xwayland-screen.h b/hw/xwayland/xwayland-screen.h
+index bd66dd68..ac704aa4 100644
+--- a/hw/xwayland/xwayland-screen.h
++++ b/hw/xwayland/xwayland-screen.h
+@@ -49,6 +49,8 @@ struct xwl_format {
+     uint64_t *modifiers;
+ };
+ 
++struct xwl_dmabuf_bridge;
++
+ struct xwl_screen {
+     int width;
+     int height;
+@@ -93,6 +95,7 @@ struct xwl_screen {
+     int wayland_fd;
+     struct wl_display *display;
+     struct wl_registry *registry;
++    struct xwl_dmabuf_bridge *dmabuf_bridge;
+     struct wl_registry *input_registry;
+     struct wl_compositor *compositor;
+     struct zwp_tablet_manager_v2 *tablet_manager;
+diff --git a/hw/xwayland/xwayland-window.h b/hw/xwayland/xwayland-window.h
+index 7fbb2a62..c3a23156 100644
+--- a/hw/xwayland/xwayland-window.h
++++ b/hw/xwayland/xwayland-window.h
+@@ -121,6 +121,7 @@ struct xwl_window {
+     struct xwl_dmabuf_feedback feedback;
+     /* If TRUE, the window buffer format supports scanout with implicit modifier */
+     Bool has_implicit_scanout_support;
++    Bool external_dmabuf_stream;
+     struct wp_tearing_control_v1 *tearing_control;
+ };
+ 

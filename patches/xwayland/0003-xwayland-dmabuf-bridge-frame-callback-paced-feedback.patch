@@ -1,0 +1,139 @@
+From e905dcd1bfac646b91f6fc77aeb520e131a330a7 Mon Sep 17 00:00:00 2001
+From: Mali Wrapper <devnull@example.com>
+Date: Sat, 21 Feb 2026 21:38:15 +0200
+Subject: [PATCH] xwayland: gate dmabuf bridge feedback on frame callback
+
+---
+ hw/xwayland/DMABUF_BRIDGE.md         |  4 +-
+ hw/xwayland/xwayland-dmabuf-bridge.c | 67 +++++++++++++++++++++++-----
+ 2 files changed, 59 insertions(+), 12 deletions(-)
+
+diff --git a/hw/xwayland/DMABUF_BRIDGE.md b/hw/xwayland/DMABUF_BRIDGE.md
+index cc233a20..e986960a 100644
+--- a/hw/xwayland/DMABUF_BRIDGE.md
++++ b/hw/xwayland/DMABUF_BRIDGE.md
+@@ -69,7 +69,7 @@ For `XWL_DMABUF_BRIDGE_OP_FEEDBACK`:
+ - server-to-client packet only
+ - `reserved` echoes the frame/probe token
+ - `flags & XWL_DMABUF_BRIDGE_FEEDBACK_FAILED` indicates frame import/commit failure
+-- `flags == 0` indicates successful buffer release from compositor (retire-like pacing signal)
++- `flags == 0` indicates completion after both `wl_buffer.release` and a `wl_surface.frame` callback
+ 
+ ## Behavior
+ 
+@@ -79,4 +79,4 @@ For `XWL_DMABUF_BRIDGE_OP_FEEDBACK`:
+ 
+ ## Notes
+ 
+-- This is still a PoC path; feedback is import/commit level and not a full retire/release timeline
++- Success feedback is paced by frame callback + buffer release to reduce visible fullscreen tearing/jitter
+diff --git a/hw/xwayland/xwayland-dmabuf-bridge.c b/hw/xwayland/xwayland-dmabuf-bridge.c
+index 0d95f93a..a963a809 100644
+--- a/hw/xwayland/xwayland-dmabuf-bridge.c
++++ b/hw/xwayland/xwayland-dmabuf-bridge.c
+@@ -64,6 +64,9 @@ struct xwl_dmabuf_bridge_buffer {
+     int feedback_fd;
+     XID xid;
+     uint32_t frame_id;
++    Bool buffer_released;
++    Bool frame_done;
++    struct wl_callback *frame_callback;
+ };
+ 
+ struct xwl_dmabuf_bridge_pending_frame {
+@@ -136,6 +139,43 @@ xwl_dmabuf_bridge_send_feedback_fd(int fd, XID xid, uint32_t frame_id, uint32_t
+     }
+ }
+ 
++static void
++xwl_dmabuf_bridge_buffer_maybe_complete(struct xwl_dmabuf_bridge_buffer *bridge_buffer)
++{
++    if (!bridge_buffer->buffer_released || !bridge_buffer->frame_done)
++        return;
++
++    xwl_dmabuf_bridge_send_feedback_fd(bridge_buffer->feedback_fd,
++                                       bridge_buffer->xid,
++                                       bridge_buffer->frame_id,
++                                       0);
++    if (bridge_buffer->feedback_fd >= 0)
++        close(bridge_buffer->feedback_fd);
++
++    free(bridge_buffer);
++}
++
++static void
++xwl_dmabuf_bridge_frame_done(void *data,
++                             struct wl_callback *callback,
++                             uint32_t callback_data)
++{
++    struct xwl_dmabuf_bridge_buffer *bridge_buffer = data;
++
++    (void) callback_data;
++
++    if (bridge_buffer->frame_callback == callback)
++        bridge_buffer->frame_callback = NULL;
++    wl_callback_destroy(callback);
++
++    bridge_buffer->frame_done = TRUE;
++    xwl_dmabuf_bridge_buffer_maybe_complete(bridge_buffer);
++}
++
++static const struct wl_callback_listener xwl_dmabuf_bridge_frame_listener = {
++    .done = xwl_dmabuf_bridge_frame_done,
++};
++
+ static Bool
+ xwl_dmabuf_bridge_set_nonblocking_cloexec(int fd)
+ {
+@@ -205,13 +245,9 @@ xwl_dmabuf_bridge_buffer_release(void *data, struct wl_buffer *buffer)
+ {
+     struct xwl_dmabuf_bridge_buffer *bridge_buffer = data;
+ 
+-    xwl_dmabuf_bridge_send_feedback_fd(bridge_buffer->feedback_fd, bridge_buffer->xid,
+-                                       bridge_buffer->frame_id, 0);
+-    if (bridge_buffer->feedback_fd >= 0)
+-        close(bridge_buffer->feedback_fd);
+-
+     wl_buffer_destroy(buffer);
+-    free(bridge_buffer);
++    bridge_buffer->buffer_released = TRUE;
++    xwl_dmabuf_bridge_buffer_maybe_complete(bridge_buffer);
+ }
+ 
+ static const struct wl_buffer_listener xwl_dmabuf_bridge_buffer_listener = {
+@@ -245,10 +281,6 @@ xwl_dmabuf_bridge_commit_buffer(struct xwl_screen *xwl_screen, XID xid,
+     bridge_buffer->xid = xid;
+     bridge_buffer->frame_id = frame_id;
+ 
+-    wl_buffer_add_listener(buffer,
+-                           &xwl_dmabuf_bridge_buffer_listener,
+-                           bridge_buffer);
+-
+     if (xwl_screen->prepare_read) {
+         wl_display_cancel_read(xwl_screen->display);
+         xwl_screen->prepare_read = 0;
+@@ -259,6 +291,21 @@ xwl_dmabuf_bridge_commit_buffer(struct xwl_screen *xwl_screen, XID xid,
+ 
+     wl_surface_attach(xwl_window->surface, buffer, 0, 0);
+     xwl_surface_damage(xwl_screen, xwl_window->surface, 0, 0, width, height);
++
++    bridge_buffer->frame_callback = wl_surface_frame(xwl_window->surface);
++    if (!bridge_buffer->frame_callback) {
++        wl_buffer_destroy(buffer);
++        free(bridge_buffer);
++        return FALSE;
++    }
++
++    wl_buffer_add_listener(buffer,
++                           &xwl_dmabuf_bridge_buffer_listener,
++                           bridge_buffer);
++    wl_callback_add_listener(bridge_buffer->frame_callback,
++                             &xwl_dmabuf_bridge_frame_listener,
++                             bridge_buffer);
++
+     wl_surface_commit(xwl_window->surface);
+ 
+     if (wl_display_flush(xwl_screen->display) < 0 && errno != EAGAIN)
+-- 
+2.43.0
+

@@ -44,6 +44,7 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <sys/shm.h>
@@ -60,6 +61,7 @@ namespace wsi
 {
 namespace x11
 {
+class xwayland_dmabuf_bridge_client;
 
 struct pending_completion
 {
@@ -240,6 +242,8 @@ private:
    VkResult allocate_wsialloc(VkImageCreateInfo &image_create_info, x11_image_data *image_data,
                               util::vector<wsialloc_format> &importable_formats, wsialloc_format *allocated_format,
                               bool avoid_allocation);
+   void init_bridge_present_rate_limit();
+   void throttle_bridge_present_if_needed();
 
    xcb_connection_t *m_connection;
    xcb_window_t m_window;
@@ -257,6 +261,13 @@ private:
     * @brief Presentation strategy for this swapchain.
     */
    std::unique_ptr<shm_presenter> m_shm_presenter;
+   std::unique_ptr<xwayland_dmabuf_bridge_client> m_xwayland_bridge;
+   bool m_use_xwayland_bridge = false;
+   uint64_t m_bridge_present_interval_ns = 0;
+   std::chrono::steady_clock::time_point m_bridge_next_present_time{};
+   bool m_bridge_present_rate_limit_initialized = false;
+   bool m_bridge_release_lag_logged = false;
+   std::deque<uint32_t> m_bridge_pending_unpresent;
 
    /**
     * @brief Image creation parameters used for all swapchain images.
@@ -275,7 +286,8 @@ private:
    VkResult get_surface_compatible_formats(const VkImageCreateInfo &info,
                                            util::vector<wsialloc_format> &importable_formats,
                                            util::vector<uint64_t> &exportable_modifers,
-                                           util::vector<VkDrmFormatModifierPropertiesEXT> &drm_format_props);
+                                           util::vector<VkDrmFormatModifierPropertiesEXT> &drm_format_props,
+                                           bool require_drm_display_support);
 
    uint64_t m_send_sbc;
    uint64_t m_target_msc;

@@ -97,19 +97,24 @@ VkResult timed_semaphore::wait(uint64_t timeout)
    res = pthread_mutex_lock(&m_mutex);
    assert(res == 0); /* only fails with programming error (EINVAL) */
 
-   if (m_count == 0)
+   switch (timeout)
    {
-      switch (timeout)
+   case 0:
+      if (m_count == 0)
       {
-      case 0:
          retval = VK_NOT_READY;
-         break;
-      case UINT64_MAX:
+      }
+      break;
+   case UINT64_MAX:
+      while (m_count == 0)
+      {
          res = pthread_cond_wait(&m_cond, &m_mutex);
          assert(res == 0); /* only fails with programming error (EINVAL) */
-
-         break;
-      default:
+      }
+      break;
+   default:
+      if (m_count == 0)
+      {
          struct timespec diff = { /* narrowing casts */
                                   static_cast<time_t>(timeout / (1000 * 1000 * 1000)),
                                   static_cast<long>(timeout % (1000 * 1000 * 1000))
@@ -128,15 +133,21 @@ VkResult timed_semaphore::wait(uint64_t timeout)
             end.tv_sec++;
          }
 
-         res = pthread_cond_timedwait(&m_cond, &m_mutex, &end);
-         /* only fails with programming error, other than timeout */
-         assert(res == 0 || res == ETIMEDOUT);
-         if (res != 0)
+         while (m_count == 0)
          {
-            retval = VK_TIMEOUT;
+            res = pthread_cond_timedwait(&m_cond, &m_mutex, &end);
+            /* only fails with programming error, other than timeout */
+            assert(res == 0 || res == ETIMEDOUT);
+            if (res == ETIMEDOUT)
+            {
+               retval = VK_TIMEOUT;
+               break;
+            }
          }
       }
+      break;
    }
+
    if (retval == VK_SUCCESS)
    {
       assert(m_count > 0);

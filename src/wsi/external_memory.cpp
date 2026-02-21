@@ -24,8 +24,10 @@
 
 #include "external_memory.hpp"
 
+#include <cerrno>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <unistd.h>
 #include <algorithm>
 
@@ -163,17 +165,31 @@ VkResult external_memory::import_plane_memory(int fd, VkDeviceMemory *memory)
    uint32_t mem_index = 0;
    TRY_LOG_CALL(get_fd_mem_type_index(fd, &mem_index));
 
-   const off_t fd_size = lseek(fd, 0, SEEK_END);
+   int import_fd = dup(fd);
+   if (import_fd < 0)
+   {
+      WSI_LOG_ERROR("Failed to dup dma-buf fd %d for Vulkan import: %s", fd, strerror(errno));
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   const off_t fd_size = lseek(import_fd, 0, SEEK_END);
    if (fd_size < 0)
    {
-      WSI_LOG_ERROR("Failed to get fd size.");
+      WSI_LOG_ERROR("Failed to get imported dma-buf fd size for fd %d: %s", import_fd, strerror(errno));
+      close(import_fd);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   if (fd_size == 0)
+   {
+      WSI_LOG_ERROR("Imported dma-buf fd %d reports zero size.", import_fd);
+      close(import_fd);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
    VkImportMemoryFdInfoKHR import_mem_info = {};
    import_mem_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
    import_mem_info.handleType = m_handle_type;
-   import_mem_info.fd = fd;
+   import_mem_info.fd = import_fd;
 
    VkMemoryAllocateInfo alloc_info = {};
    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -182,8 +198,16 @@ VkResult external_memory::import_plane_memory(int fd, VkDeviceMemory *memory)
    alloc_info.memoryTypeIndex = mem_index;
 
    auto &device_data = wsi::device_private_data::get(m_device);
-   TRY_LOG(device_data.disp.AllocateMemory(m_device, &alloc_info, m_allocator.get_original_callbacks(), memory),
-           "Failed to import device memory");
+
+   const VkResult result =
+      device_data.disp.AllocateMemory(m_device, &alloc_info, m_allocator.get_original_callbacks(), memory);
+   if (result != VK_SUCCESS)
+   {
+      /* Vulkan takes ownership of import_fd only on successful import. */
+      close(import_fd);
+      WSI_LOG_ERROR("Failed to import device memory from dma-buf fd %d (VkResult=%d)", fd, result);
+      return result;
+   }
 
    return VK_SUCCESS;
 }
@@ -407,15 +431,31 @@ void external_memory::cleanup_external_memory()
       {
          auto &device_data = wsi::device_private_data::get(m_device);
          device_data.disp.FreeMemory(m_device, memory, m_allocator.get_original_callbacks());
+         memory = VK_NULL_HANDLE;
       }
-      else if (m_buffer_fds[plane] >= 0)
+
+      const int fd = m_buffer_fds[plane];
+      if (fd < 0)
       {
-         auto it = std::find(std::begin(m_buffer_fds), std::end(m_buffer_fds), m_buffer_fds[plane]);
-         if (std::distance(std::begin(m_buffer_fds), it) == static_cast<int>(plane))
+         continue;
+      }
+
+      bool seen_earlier = false;
+      for (uint32_t prev = 0; prev < plane; prev++)
+      {
+         if (m_buffer_fds[prev] == fd)
          {
-            close(m_buffer_fds[plane]);
+            seen_earlier = true;
+            break;
          }
       }
+
+      if (!seen_earlier)
+      {
+         close(fd);
+      }
+
+      m_buffer_fds[plane] = -1;
    }
 }
 
