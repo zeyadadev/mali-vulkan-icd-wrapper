@@ -59,67 +59,56 @@ sudo rm -f /usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.
 
 ### Prerequisites
 
-**Note:** Complete the Mali Driver Installation above first, then install build dependencies.
+Complete the Mali Driver Installation above first.
+
+Recommended: let the wrapper script install build dependencies (apt-based systems):
 
 ```bash
-# Add armhf architecture for 32-bit support
-sudo dpkg --add-architecture armhf
-sudo apt update
-
-# Essential build tools
-sudo apt install build-essential cmake pkg-config libvulkan-dev
-
-# Window system support
-sudo apt install libwayland-dev libx11-dev libx11-xcb-dev libdrm-dev
-sudo apt install libxcb-shm0-dev libxcb-present-dev libxcb-sync-dev
-sudo apt install libxrandr-dev wayland-protocols
-
-# For 32-bit builds
-sudo apt install gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-sudo apt install libdrm-dev:armhf libwayland-dev:armhf libx11-dev:armhf
-sudo apt install libx11-xcb-dev:armhf libxcb-shm0-dev:armhf
-sudo apt install libxcb-present-dev:armhf libxcb-sync-dev:armhf libxrandr-dev:armhf
+./scripts/wrapper/build_wrapper.sh
 ```
 
-### Build and Install
+When prompted, answer `yes` to dependency installation.
 
-**64-bit wrapper:**
+### Build and Install (Recommended)
+
+Use the wrapper script:
 ```bash
-cmake -S . -B build64 \
-  -DCMAKE_INSTALL_PREFIX=/usr \
-  -DCMAKE_BUILD_TYPE=Release
+./scripts/wrapper/build_wrapper.sh
+```
 
+Useful non-interactive examples:
+```bash
+# Build + install 64-bit only
+WRAPPER_INTERACTIVE=0 WRAPPER_BUILD_64BIT=1 WRAPPER_BUILD_32BIT=0 ./scripts/wrapper/build_wrapper.sh
+
+# Build + install both 64-bit and 32-bit
+WRAPPER_INTERACTIVE=0 WRAPPER_BUILD_64BIT=1 WRAPPER_BUILD_32BIT=1 ./scripts/wrapper/build_wrapper.sh
+
+# Also install apt build dependencies automatically
+WRAPPER_INTERACTIVE=0 WRAPPER_INSTALL_BUILD_DEPS=1 WRAPPER_BUILD_64BIT=1 WRAPPER_BUILD_32BIT=1 ./scripts/wrapper/build_wrapper.sh
+
+# Build/install 64-bit only and remove previous 32-bit wrapper artifacts
+WRAPPER_INTERACTIVE=0 WRAPPER_BUILD_64BIT=1 WRAPPER_BUILD_32BIT=0 WRAPPER_PRUNE_UNSELECTED_ARCH=1 ./scripts/wrapper/build_wrapper.sh
+```
+
+When `WRAPPER_INSTALL_SYSTEM=1` (default), the script automatically:
+- checks/removes known conflicting Vulkan ICD files
+- force-reinstalls selected wrapper outputs
+
+### Manual CMake (Advanced)
+
+Only needed for custom CI/packaging flows. The script above is the recommended path.
+
+```bash
+# 64-bit
+cmake -S . -B build64 -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
 cmake --build build64 -j$(nproc)
 sudo cmake --install build64
-```
 
-**32-bit wrapper:**
-```bash
-cmake -S . -B build32 \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/armhf_toolchain.cmake \
-  -DCMAKE_INSTALL_PREFIX=/usr \
-  -DCMAKE_BUILD_TYPE=Release
-
+# 32-bit
+cmake -S . -B build32 -DCMAKE_TOOLCHAIN_FILE=cmake/armhf_toolchain.cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
 cmake --build build32 -j$(nproc)
 sudo cmake --install build32
-```
-
-**Both at once:**
-```bash
-# Configure both
-cmake -S . -B build64 \
-  -DCMAKE_INSTALL_PREFIX=/usr \
-  -DCMAKE_BUILD_TYPE=Release
-cmake -S . -B build32 \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/armhf_toolchain.cmake \
-  -DCMAKE_INSTALL_PREFIX=/usr \
-  -DCMAKE_BUILD_TYPE=Release
-
-# Build both
-cmake --build build64 -j$(nproc) & cmake --build build32 -j$(nproc) & wait
-
-# Install both
-sudo cmake --install build64 && sudo cmake --install build32
 ```
 
 ### Test It
@@ -167,13 +156,10 @@ file /usr/lib/arm-linux-gnueabihf/libmali_wrapper.so   # 32-bit
 
 ## Experimental: X11 zero-copy via patched Xwayland
 
-An experimental out-of-tree Xwayland dmabuf bridge patch flow is included in this repo.
+This repo includes an optional out-of-tree Xwayland dmabuf bridge flow for experimental X11 zero-copy presentation.
 
-- Patch series: `patches/xwayland/`
-- Build script: `scripts/xwayland/build_patched_xwayland.sh`
-- Full guide: `docs/xwayland-dmabuf-bridge.md`
-- Runtime toggle: `XWL_DMABUF_BRIDGE=/run/user/$(id -u)/xwl-dmabuf.sock`
-- Bridge modifier policy: non-linear modifiers are preferred by default; set `XWL_DMABUF_BRIDGE_PREFER_LINEAR=1` to force linear preference
+- Build helper: `scripts/xwayland/build_patched_xwayland.sh`
+- Full setup/runtime/rollback guide: `docs/xwayland-dmabuf-bridge.md`
 
 ## Debugging
 

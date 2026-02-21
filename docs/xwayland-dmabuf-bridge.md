@@ -7,8 +7,17 @@ This repository carries an out-of-tree Xwayland patch series for a single-window
 - Patch series:
   - `patches/xwayland/0001-xwayland-dmabuf-bridge-poc.patch`
   - `patches/xwayland/0002-xwayland-dmabuf-bridge-feedback-sync.patch`
+  - `patches/xwayland/0003-xwayland-dmabuf-bridge-frame-callback-paced-feedback.patch`
+  - `patches/xwayland/0004-xwayland-dmabuf-bridge-feedback-on-frame-callback.patch`
 - Build helper:
   - `scripts/xwayland/build_patched_xwayland.sh`
+
+Patch summary:
+
+- `0001`: initial dmabuf bridge socket + packet ABI + import/commit path.
+- `0002`: bridge sync protocol (`HELLO` / `FEEDBACK`) for ACK-based pacing in wrapper.
+- `0003`: gate success feedback using frame callback pacing behavior.
+- `0004`: finalize success feedback semantics on `wl_surface.frame` callback (present cadence).
 
 The script clones upstream `xserver`, checks out `xwayland-23.2.6`, applies local patches, builds, and installs into:
 
@@ -26,10 +35,32 @@ sudo apt install libxkbfile-dev libxshmfence-dev libxfont-dev libfontenc-dev lib
 sudo apt install libtirpc-dev
 ```
 
+You can also let the build script install these dependencies automatically on apt-based systems:
+
+```bash
+XSERVER_INSTALL_BUILD_DEPS=1 ./scripts/xwayland/build_patched_xwayland.sh
+```
+
 ## Build patched Xwayland
 
 ```bash
 ./scripts/xwayland/build_patched_xwayland.sh
+```
+
+By default, when run in a terminal, the script is interactive and prompts for:
+
+- dependency install
+- system install to `/usr/bin/Xwayland`
+- reboot after install
+
+Control this with:
+
+```bash
+# force interactive prompts
+XSERVER_INTERACTIVE=1 ./scripts/xwayland/build_patched_xwayland.sh
+
+# force non-interactive behavior (use env flags only)
+XSERVER_INTERACTIVE=0 ./scripts/xwayland/build_patched_xwayland.sh
 ```
 
 Useful overrides:
@@ -43,7 +74,23 @@ MESON_EXTRA_ARGS='-Dglamor=true -Dxwayland_ei=false' ./scripts/xwayland/build_pa
 
 # if libtirpc-dev is installed and desired
 XSERVER_SECURE_RPC=true ./scripts/xwayland/build_patched_xwayland.sh
+
+# auto-install build deps (apt only)
+XSERVER_INSTALL_BUILD_DEPS=1 ./scripts/xwayland/build_patched_xwayland.sh
+
+# install patched binary into /usr/bin/Xwayland (backs up to /usr/bin/Xwayland.orig once)
+XSERVER_INSTALL_SYSTEM=1 ./scripts/xwayland/build_patched_xwayland.sh
+
+# install system-wide and reboot automatically at the end
+XSERVER_INSTALL_SYSTEM=1 XSERVER_REBOOT_AFTER_INSTALL=1 ./scripts/xwayland/build_patched_xwayland.sh
 ```
+
+System install/reboot options are always opt-in:
+
+- `XSERVER_INSTALL_SYSTEM=1`: install `${PREFIX_DIR}/bin/Xwayland` to `/usr/bin/Xwayland`
+- `XSERVER_SYSTEM_XWAYLAND_PATH=/path/to/Xwayland`: override install destination
+- `XSERVER_SYSTEM_XWAYLAND_BACKUP_PATH=/path/to/backup`: override backup path
+- `XSERVER_REBOOT_AFTER_INSTALL=1`: reboot after build/install
 
 ## Use patched Xwayland in session
 
@@ -101,7 +148,7 @@ Runtime behavior:
   - `xwayland dmabuf bridge: failed to commit created buffer xid=... format=... modifier=...`
 - The bridge now uses `zwp_linux_buffer_params_v1_create()` (non-fatal import path), so a bad frame should not terminate Xwayland.
 - With the updated Xwayland patch series, the bridge includes ACK-based feedback (`HELLO`/`FEEDBACK`) and the wrapper uses that for pacing; timer pacing remains as fallback.
-  - ACK success is tied to compositor buffer release, so pacing follows compositor retire cadence more closely than import-time ACK.
+  - ACK success is emitted on `wl_surface.frame` callback (present cadence signal).
   - Wrapper log when active: `Xwayland bridge: sync feedback enabled (ack-based pacing)`
   - Wrapper fallback log (old Xwayland): `Xwayland bridge: sync feedback unsupported by server, using fallback pacing`
 - If explicit linear import fails (`modifier=0x0`), patched Xwayland retries once with implicit modifier semantics (`DRM_FORMAT_MOD_INVALID`) and logs:
