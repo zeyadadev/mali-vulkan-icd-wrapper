@@ -763,7 +763,6 @@ void swapchain_base::clear_descendant()
 
 VkResult swapchain_base::wait_for_free_buffer(uint64_t timeout)
 {
-   const uint64_t original_timeout = timeout;
    VkResult retval;
    /* first see if a buffer is already marked as free */
    retval = m_free_image_semaphore.wait(0);
@@ -779,11 +778,6 @@ VkResult swapchain_base::wait_for_free_buffer(uint64_t timeout)
          /* the sub-implementation has done it's thing, so re-check the
           * semaphore */
          retval = m_free_image_semaphore.wait(timeout);
-         if (retval == VK_NOT_READY && timeout == 0 && original_timeout == UINT64_MAX)
-         {
-            /* Race: backend observed a free image just before semaphore post. */
-            retval = m_free_image_semaphore.wait(UINT64_MAX);
-         }
       }
    }
 
