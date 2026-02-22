@@ -47,7 +47,7 @@ pkg_check_modules(LIBDRM REQUIRED libdrm)
 find_package(X11 REQUIRED)
 
 # Find XCB
-pkg_check_modules(XCB REQUIRED xcb xcb-shm xcb-sync)
+pkg_check_modules(XCB REQUIRED xcb xcb-dri3 xcb-shm xcb-sync)
 
 # Find Xrandr for X11
 find_library(XRANDR_LIBRARY Xrandr REQUIRED)
@@ -232,6 +232,7 @@ set(COMMON_LIBRARIES
     ${X11_Xrandr_LIB}
     ${XCB_LIBRARIES}
     X11-xcb
+    xcb-dri3
     xcb-shm
     xcb-sync
     drm

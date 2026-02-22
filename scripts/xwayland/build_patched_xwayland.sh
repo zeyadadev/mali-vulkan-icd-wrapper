@@ -16,6 +16,20 @@ INTERACTIVE_MODE="${XSERVER_INTERACTIVE:-auto}"
 SYSTEM_XWAYLAND_PATH="${XSERVER_SYSTEM_XWAYLAND_PATH:-/usr/bin/Xwayland}"
 SYSTEM_XWAYLAND_BACKUP_PATH="${XSERVER_SYSTEM_XWAYLAND_BACKUP_PATH:-/usr/bin/Xwayland.orig}"
 
+DEFAULT_RUNTIME_UID="$(id -u)"
+DEFAULT_USER_HOME="${HOME}"
+if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    DEFAULT_RUNTIME_UID="${SUDO_UID:-${DEFAULT_RUNTIME_UID}}"
+    SUDO_HOME="$(getent passwd "${SUDO_USER}" | cut -d: -f6 || true)"
+    if [[ -n "${SUDO_HOME}" ]]; then
+        DEFAULT_USER_HOME="${SUDO_HOME}"
+    fi
+fi
+
+CONFIGURE_BRIDGE_ENV="${XSERVER_CONFIGURE_BRIDGE_ENV:-true}"
+BRIDGE_SOCKET_PATH="${XSERVER_BRIDGE_SOCKET_PATH:-/run/user/${DEFAULT_RUNTIME_UID}/xwl-dmabuf.sock}"
+BRIDGE_ENV_FILE="${XSERVER_BRIDGE_ENV_FILE:-${DEFAULT_USER_HOME}/.config/environment.d/90-xwl-bridge.conf}"
+
 is_true() {
     case "${1,,}" in
         1|true|yes|on) return 0 ;;
@@ -88,6 +102,7 @@ configure_interactive_options_if_requested() {
     echo "  - clone/reset/clean ${XSERVER_DIR}"
     echo "  - apply patches from ${PATCH_DIR}"
     echo "  - build/install into ${PREFIX_DIR}"
+    echo "  - optionally persist XWL_DMABUF_BRIDGE for new login sessions"
     echo
 
     if ! prompt_yes_no "Continue with this run?" "true"; then
@@ -108,12 +123,19 @@ configure_interactive_options_if_requested() {
     fi
 
     if is_true "${INSTALL_SYSTEM_XWAYLAND}"; then
+        if prompt_yes_no "Persist XWL_DMABUF_BRIDGE in ${BRIDGE_ENV_FILE}?" "${CONFIGURE_BRIDGE_ENV}"; then
+            CONFIGURE_BRIDGE_ENV="true"
+        else
+            CONFIGURE_BRIDGE_ENV="false"
+        fi
+
         if prompt_yes_no "Reboot automatically after successful install?" "${REBOOT_AFTER_INSTALL}"; then
             REBOOT_AFTER_INSTALL="true"
         else
             REBOOT_AFTER_INSTALL="false"
         fi
     else
+        CONFIGURE_BRIDGE_ENV="false"
         REBOOT_AFTER_INSTALL="false"
     fi
 
@@ -121,6 +143,11 @@ configure_interactive_options_if_requested() {
     echo "Selected options:"
     echo "  install dependencies : ${INSTALL_BUILD_DEPS}"
     echo "  system install       : ${INSTALL_SYSTEM_XWAYLAND}"
+    echo "  configure bridge env : ${CONFIGURE_BRIDGE_ENV}"
+    if is_true "${CONFIGURE_BRIDGE_ENV}"; then
+        echo "  bridge socket path   : ${BRIDGE_SOCKET_PATH}"
+        echo "  bridge env file      : ${BRIDGE_ENV_FILE}"
+    fi
     echo "  reboot after install : ${REBOOT_AFTER_INSTALL}"
     echo
 
@@ -170,6 +197,11 @@ install_build_dependencies_if_requested() {
         wayland-protocols
         libdrm-dev
         libepoxy-dev
+        libgbm-dev
+        libpixman-1-dev
+        mesa-common-dev
+        libxcb-xinput-dev
+        libxcb-damage0-dev
     )
 
     if is_true "${SECURE_RPC}"; then
@@ -201,6 +233,31 @@ install_system_xwayland_if_requested() {
     run_as_root install -m 0755 "${built_xwayland}" "${SYSTEM_XWAYLAND_PATH}"
 }
 
+configure_bridge_environment_if_requested() {
+    if ! is_true "${CONFIGURE_BRIDGE_ENV}"; then
+        return
+    fi
+
+    local env_dir
+    env_dir="$(dirname "${BRIDGE_ENV_FILE}")"
+    mkdir -p "${env_dir}"
+    printf 'XWL_DMABUF_BRIDGE=%s\n' "${BRIDGE_SOCKET_PATH}" > "${BRIDGE_ENV_FILE}"
+    chmod 0644 "${BRIDGE_ENV_FILE}"
+
+    export XWL_DMABUF_BRIDGE="${BRIDGE_SOCKET_PATH}"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user import-environment XWL_DMABUF_BRIDGE >/dev/null 2>&1 || true
+    fi
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --systemd XWL_DMABUF_BRIDGE >/dev/null 2>&1 || true
+    fi
+
+    echo "Configured persistent bridge env:"
+    echo "  ${BRIDGE_ENV_FILE}"
+    echo "  XWL_DMABUF_BRIDGE=${BRIDGE_SOCKET_PATH}"
+    echo "NOTE: log out and back in so the next Xwayland process picks up this variable."
+}
+
 reboot_if_requested() {
     if ! is_true "${REBOOT_AFTER_INSTALL}"; then
         return
@@ -220,8 +277,15 @@ reboot_if_requested() {
 normalize_bool_var "SECURE_RPC"
 normalize_bool_var "INSTALL_BUILD_DEPS"
 normalize_bool_var "INSTALL_SYSTEM_XWAYLAND"
+normalize_bool_var "CONFIGURE_BRIDGE_ENV"
 normalize_bool_var "REBOOT_AFTER_INSTALL"
 configure_interactive_options_if_requested
+
+if ! is_true "${INSTALL_SYSTEM_XWAYLAND}"; then
+    CONFIGURE_BRIDGE_ENV="false"
+    REBOOT_AFTER_INSTALL="false"
+fi
+
 install_build_dependencies_if_requested
 
 for cmd in git meson; do
@@ -288,6 +352,7 @@ meson compile -C "${BUILD_DIR}"
 echo "Installing into ${PREFIX_DIR}"
 meson install -C "${BUILD_DIR}"
 install_system_xwayland_if_requested
+configure_bridge_environment_if_requested
 
 echo
 echo "Done. Patched binary:"
@@ -295,6 +360,10 @@ echo "  ${PREFIX_DIR}/bin/Xwayland"
 if is_true "${INSTALL_SYSTEM_XWAYLAND}"; then
     echo "Installed system binary:"
     echo "  ${SYSTEM_XWAYLAND_PATH}"
+fi
+if is_true "${CONFIGURE_BRIDGE_ENV}"; then
+    echo "Bridge env file:"
+    echo "  ${BRIDGE_ENV_FILE}"
 fi
 if is_true "${REBOOT_AFTER_INSTALL}"; then
     echo "System reboot requested."

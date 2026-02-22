@@ -51,6 +51,7 @@ By default, when run in a terminal, the script is interactive and prompts for:
 
 - dependency install
 - system install to `/usr/bin/Xwayland`
+- persistent bridge env setup (`~/.config/environment.d/90-xwl-bridge.conf`)
 - reboot after install
 
 Control this with:
@@ -83,6 +84,11 @@ XSERVER_INSTALL_SYSTEM=1 ./scripts/xwayland/build_patched_xwayland.sh
 
 # install system-wide and reboot automatically at the end
 XSERVER_INSTALL_SYSTEM=1 XSERVER_REBOOT_AFTER_INSTALL=1 ./scripts/xwayland/build_patched_xwayland.sh
+
+# override persistent bridge env behavior/path when system install is enabled
+XSERVER_INSTALL_SYSTEM=1 XSERVER_CONFIGURE_BRIDGE_ENV=0 ./scripts/xwayland/build_patched_xwayland.sh
+XSERVER_INSTALL_SYSTEM=1 XSERVER_BRIDGE_SOCKET_PATH=/run/user/$(id -u)/xwl-dmabuf.sock ./scripts/xwayland/build_patched_xwayland.sh
+XSERVER_INSTALL_SYSTEM=1 XSERVER_BRIDGE_ENV_FILE="$HOME/.config/environment.d/90-xwl-bridge.conf" ./scripts/xwayland/build_patched_xwayland.sh
 ```
 
 System install/reboot options are always opt-in:
@@ -90,6 +96,9 @@ System install/reboot options are always opt-in:
 - `XSERVER_INSTALL_SYSTEM=1`: install `${PREFIX_DIR}/bin/Xwayland` to `/usr/bin/Xwayland`
 - `XSERVER_SYSTEM_XWAYLAND_PATH=/path/to/Xwayland`: override install destination
 - `XSERVER_SYSTEM_XWAYLAND_BACKUP_PATH=/path/to/backup`: override backup path
+- `XSERVER_CONFIGURE_BRIDGE_ENV=1` (default with system install): write persistent `XWL_DMABUF_BRIDGE` env file
+- `XSERVER_BRIDGE_SOCKET_PATH=/run/user/<uid>/xwl-dmabuf.sock`: socket path written to env file
+- `XSERVER_BRIDGE_ENV_FILE=~/.config/environment.d/90-xwl-bridge.conf`: persistent env file path
 - `XSERVER_REBOOT_AFTER_INSTALL=1`: reboot after build/install
 
 ## Use patched Xwayland in session
@@ -116,6 +125,12 @@ The patch adds an optional UNIX socket bridge enabled by:
 ```bash
 export XWL_DMABUF_BRIDGE=/run/user/$(id -u)/xwl-dmabuf.sock
 ```
+
+When `XSERVER_INSTALL_SYSTEM=1`, the helper script now configures this automatically by default via:
+
+- `~/.config/environment.d/90-xwl-bridge.conf`
+
+You still need to log out and log back in so the next Xwayland process inherits it.
 
 The socket ABI and packet format are documented in:
 

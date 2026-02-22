@@ -90,11 +90,20 @@ WRAPPER_INTERACTIVE=0 WRAPPER_INSTALL_BUILD_DEPS=1 WRAPPER_BUILD_64BIT=1 WRAPPER
 
 # Build/install 64-bit only and remove previous 32-bit wrapper artifacts
 WRAPPER_INTERACTIVE=0 WRAPPER_BUILD_64BIT=1 WRAPPER_BUILD_32BIT=0 WRAPPER_PRUNE_UNSELECTED_ARCH=1 ./scripts/wrapper/build_wrapper.sh
+
+# Disable automatic dma_heap udev setup
+WRAPPER_INTERACTIVE=0 WRAPPER_CONFIGURE_DMA_HEAP_UDEV=0 ./scripts/wrapper/build_wrapper.sh
 ```
 
 When `WRAPPER_INSTALL_SYSTEM=1` (default), the script automatically:
 - checks/removes known conflicting Vulkan ICD files
 - force-reinstalls selected wrapper outputs
+- configures `/dev/dma_heap` udev permissions for non-root runtime
+  - rule file: `/etc/udev/rules.d/99-mali-wrapper-dma-heap.rules`
+  - default rule: `SUBSYSTEM=="dma_heap", OWNER="root", GROUP="video", MODE="0660"`
+  - optional user group add (defaults to invoking user)
+
+If the script adds your user to a new dma_heap access group, log out and back in once for group membership to take effect.
 
 ### Manual CMake (Advanced)
 

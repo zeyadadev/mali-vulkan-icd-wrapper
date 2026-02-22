@@ -21,6 +21,21 @@ TOOLCHAIN_FILE="${WRAPPER_TOOLCHAIN_FILE:-${ROOT_DIR}/cmake/armhf_toolchain.cmak
 MALI_DRIVER_PATH_64="${WRAPPER_MALI_DRIVER_PATH_64:-/usr/lib/aarch64-linux-gnu/libmali.so}"
 MALI_DRIVER_PATH_32="${WRAPPER_MALI_DRIVER_PATH_32:-/usr/lib/arm-linux-gnueabihf/libmali.so}"
 JOBS="${WRAPPER_JOBS:-$(nproc)}"
+CONFIGURE_DMA_HEAP_UDEV="${WRAPPER_CONFIGURE_DMA_HEAP_UDEV:-true}"
+DMA_HEAP_ADD_USER_TO_GROUP="${WRAPPER_DMA_HEAP_ADD_USER_TO_GROUP:-true}"
+DMA_HEAP_UDEV_RULE_FILE="${WRAPPER_DMA_HEAP_UDEV_RULE_FILE:-/etc/udev/rules.d/99-mali-wrapper-dma-heap.rules}"
+DMA_HEAP_UDEV_OWNER="${WRAPPER_DMA_HEAP_UDEV_OWNER:-root}"
+DMA_HEAP_UDEV_GROUP="${WRAPPER_DMA_HEAP_UDEV_GROUP:-video}"
+DMA_HEAP_UDEV_MODE="${WRAPPER_DMA_HEAP_UDEV_MODE:-0660}"
+DMA_HEAP_TARGET_USER="${WRAPPER_DMA_HEAP_USER:-${SUDO_USER:-${USER:-}}}"
+DMA_HEAP_GROUP_MEMBERSHIP_CHANGED="false"
+
+if [[ "${DMA_HEAP_TARGET_USER}" == "root" ]]; then
+    DMA_HEAP_TARGET_USER=""
+fi
+if [[ -z "${DMA_HEAP_TARGET_USER}" ]]; then
+    DMA_HEAP_ADD_USER_TO_GROUP="false"
+fi
 
 is_true() {
     case "${1,,}" in
@@ -105,6 +120,7 @@ configure_interactive_options_if_requested() {
     echo "  - build the wrapper (64-bit, 32-bit, or both)"
     echo "  - optionally install build dependencies (apt)"
     echo "  - optionally install to ${INSTALL_PREFIX}"
+    echo "  - optionally configure dma_heap permissions for non-root runtime"
     echo "  - optionally reboot after install"
     echo
 
@@ -169,6 +185,26 @@ configure_interactive_options_if_requested() {
             PRUNE_UNSELECTED_ARCH="false"
         fi
 
+        if prompt_yes_no "Configure /dev/dma_heap udev permissions?" "${CONFIGURE_DMA_HEAP_UDEV}"; then
+            CONFIGURE_DMA_HEAP_UDEV="true"
+        else
+            CONFIGURE_DMA_HEAP_UDEV="false"
+        fi
+
+        if is_true "${CONFIGURE_DMA_HEAP_UDEV}"; then
+            if [[ -n "${DMA_HEAP_TARGET_USER}" ]]; then
+                if prompt_yes_no "Add '${DMA_HEAP_TARGET_USER}' to '${DMA_HEAP_UDEV_GROUP}' group?" "${DMA_HEAP_ADD_USER_TO_GROUP}"; then
+                    DMA_HEAP_ADD_USER_TO_GROUP="true"
+                else
+                    DMA_HEAP_ADD_USER_TO_GROUP="false"
+                fi
+            else
+                DMA_HEAP_ADD_USER_TO_GROUP="false"
+            fi
+        else
+            DMA_HEAP_ADD_USER_TO_GROUP="false"
+        fi
+
         if prompt_yes_no "Reboot automatically after successful install?" "${REBOOT_AFTER_INSTALL}"; then
             REBOOT_AFTER_INSTALL="true"
         else
@@ -179,6 +215,8 @@ configure_interactive_options_if_requested() {
         REMOVE_CONFLICTS="false"
         PRUNE_UNSELECTED_ARCH="false"
         FORCE_REINSTALL="false"
+        CONFIGURE_DMA_HEAP_UDEV="false"
+        DMA_HEAP_ADD_USER_TO_GROUP="false"
         REBOOT_AFTER_INSTALL="false"
     fi
 
@@ -193,6 +231,13 @@ configure_interactive_options_if_requested() {
     echo "  prune unselected     : ${PRUNE_UNSELECTED_ARCH}"
     echo "  force reinstall      : ${FORCE_REINSTALL} (auto when install=true)"
     echo "  install wrappers     : ${INSTALL_SYSTEM}"
+    echo "  configure dma_heap   : ${CONFIGURE_DMA_HEAP_UDEV}"
+    if is_true "${CONFIGURE_DMA_HEAP_UDEV}"; then
+        echo "  dma_heap rule file   : ${DMA_HEAP_UDEV_RULE_FILE}"
+        echo "  dma_heap owner/group : ${DMA_HEAP_UDEV_OWNER}:${DMA_HEAP_UDEV_GROUP}"
+        echo "  dma_heap mode        : ${DMA_HEAP_UDEV_MODE}"
+        echo "  add user to group    : ${DMA_HEAP_ADD_USER_TO_GROUP} (${DMA_HEAP_TARGET_USER:-none})"
+    fi
     echo "  reboot after install : ${REBOOT_AFTER_INSTALL}"
     echo "  install prefix       : ${INSTALL_PREFIX}"
     echo "  build type           : ${CMAKE_BUILD_TYPE}"
@@ -225,6 +270,7 @@ install_build_dependencies_if_requested() {
         libx11-dev
         libx11-xcb-dev
         libdrm-dev
+        libxcb-dri3-dev
         libxcb-shm0-dev
         libxcb-present-dev
         libxcb-sync-dev
@@ -235,10 +281,12 @@ install_build_dependencies_if_requested() {
     local cross_pkgs=(
         gcc-arm-linux-gnueabihf
         g++-arm-linux-gnueabihf
+        libvulkan-dev:armhf
         libdrm-dev:armhf
         libwayland-dev:armhf
         libx11-dev:armhf
         libx11-xcb-dev:armhf
+        libxcb-dri3-dev:armhf
         libxcb-shm0-dev:armhf
         libxcb-present-dev:armhf
         libxcb-sync-dev:armhf
@@ -614,6 +662,68 @@ post_install_verification() {
     fi
 }
 
+configure_dma_heap_permissions_if_requested() {
+    if ! is_true "${INSTALL_SYSTEM}"; then
+        return
+    fi
+
+    if ! is_true "${CONFIGURE_DMA_HEAP_UDEV}"; then
+        return
+    fi
+
+    if ! command -v udevadm >/dev/null 2>&1; then
+        echo "WARN: udevadm is unavailable; skipping dma_heap udev rule setup."
+        return
+    fi
+
+    if ! getent group "${DMA_HEAP_UDEV_GROUP}" >/dev/null; then
+        echo "Creating group '${DMA_HEAP_UDEV_GROUP}' for dma_heap access"
+        run_as_root groupadd --system "${DMA_HEAP_UDEV_GROUP}" || true
+        if ! getent group "${DMA_HEAP_UDEV_GROUP}" >/dev/null; then
+            echo "Failed to create group '${DMA_HEAP_UDEV_GROUP}'." >&2
+            exit 1
+        fi
+    fi
+
+    local tmp_rule=""
+    tmp_rule="$(mktemp)"
+    printf 'SUBSYSTEM=="dma_heap", OWNER="%s", GROUP="%s", MODE="%s"\n' \
+        "${DMA_HEAP_UDEV_OWNER}" "${DMA_HEAP_UDEV_GROUP}" "${DMA_HEAP_UDEV_MODE}" > "${tmp_rule}"
+    run_as_root install -D -m 0644 "${tmp_rule}" "${DMA_HEAP_UDEV_RULE_FILE}"
+    rm -f "${tmp_rule}"
+
+    echo "Reloading udev rules for dma_heap"
+    run_as_root udevadm control --reload-rules
+    run_as_root udevadm trigger --subsystem-match=dma_heap || true
+
+    local dma_heap_nodes=()
+    shopt -s nullglob
+    dma_heap_nodes=(/dev/dma_heap/*)
+    shopt -u nullglob
+    if [[ "${#dma_heap_nodes[@]}" -gt 0 ]]; then
+        run_as_root chgrp "${DMA_HEAP_UDEV_GROUP}" -- "${dma_heap_nodes[@]}" || true
+        run_as_root chmod "${DMA_HEAP_UDEV_MODE}" -- "${dma_heap_nodes[@]}" || true
+    fi
+
+    if is_true "${DMA_HEAP_ADD_USER_TO_GROUP}"; then
+        if [[ -z "${DMA_HEAP_TARGET_USER}" ]]; then
+            echo "WARN: no non-root target user resolved for dma_heap group membership update."
+        elif ! id "${DMA_HEAP_TARGET_USER}" >/dev/null 2>&1; then
+            echo "WARN: user '${DMA_HEAP_TARGET_USER}' not found; skipping group membership update."
+        elif id -nG "${DMA_HEAP_TARGET_USER}" | tr ' ' '\n' | grep -Fxq "${DMA_HEAP_UDEV_GROUP}"; then
+            :
+        else
+            echo "Adding user '${DMA_HEAP_TARGET_USER}' to '${DMA_HEAP_UDEV_GROUP}' group"
+            run_as_root usermod -a -G "${DMA_HEAP_UDEV_GROUP}" "${DMA_HEAP_TARGET_USER}"
+            DMA_HEAP_GROUP_MEMBERSHIP_CHANGED="true"
+        fi
+    fi
+
+    echo "Configured dma_heap permissions:"
+    echo "  rule file: ${DMA_HEAP_UDEV_RULE_FILE}"
+    echo "  rule     : SUBSYSTEM==\"dma_heap\", OWNER=\"${DMA_HEAP_UDEV_OWNER}\", GROUP=\"${DMA_HEAP_UDEV_GROUP}\", MODE=\"${DMA_HEAP_UDEV_MODE}\""
+}
+
 reboot_if_requested() {
     if ! is_true "${REBOOT_AFTER_INSTALL}"; then
         return
@@ -640,6 +750,8 @@ normalize_bool_var "CHECK_CONFLICTS"
 normalize_bool_var "REMOVE_CONFLICTS"
 normalize_bool_var "PRUNE_UNSELECTED_ARCH"
 normalize_bool_var "FORCE_REINSTALL"
+normalize_bool_var "CONFIGURE_DMA_HEAP_UDEV"
+normalize_bool_var "DMA_HEAP_ADD_USER_TO_GROUP"
 configure_interactive_options_if_requested
 
 if [[ "${BUILD_64BIT}" == "false" && "${BUILD_32BIT}" == "false" ]]; then
@@ -656,6 +768,8 @@ else
     REMOVE_CONFLICTS="false"
     PRUNE_UNSELECTED_ARCH="false"
     FORCE_REINSTALL="false"
+    CONFIGURE_DMA_HEAP_UDEV="false"
+    DMA_HEAP_ADD_USER_TO_GROUP="false"
     REBOOT_AFTER_INSTALL="false"
 fi
 
@@ -668,6 +782,8 @@ if ! [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
+install_build_dependencies_if_requested
+
 for cmd in cmake; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         echo "Required tool missing: ${cmd}" >&2
@@ -675,7 +791,6 @@ for cmd in cmake; do
     fi
 done
 
-install_build_dependencies_if_requested
 warn_if_prefix_manifest_mismatch
 warn_if_vulkan_env_overrides_present
 check_mali_driver_preflight
@@ -692,6 +807,7 @@ if is_true "${BUILD_32BIT}"; then
 fi
 
 post_install_verification
+configure_dma_heap_permissions_if_requested
 
 echo
 echo "Done."
@@ -705,6 +821,12 @@ if is_true "${INSTALL_SYSTEM}"; then
     echo "Installed to prefix: ${INSTALL_PREFIX}"
 else
     echo "Install skipped (WRAPPER_INSTALL_SYSTEM=false)"
+fi
+if is_true "${CONFIGURE_DMA_HEAP_UDEV}"; then
+    echo "dma_heap udev rule: ${DMA_HEAP_UDEV_RULE_FILE}"
+    if is_true "${DMA_HEAP_GROUP_MEMBERSHIP_CHANGED}"; then
+        echo "NOTE: user '${DMA_HEAP_TARGET_USER}' was added to '${DMA_HEAP_UDEV_GROUP}'. Log out/in for group changes."
+    fi
 fi
 
 reboot_if_requested

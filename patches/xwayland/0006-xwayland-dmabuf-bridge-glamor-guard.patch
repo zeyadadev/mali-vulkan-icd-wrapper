@@ -1,0 +1,22 @@
+--- a/hw/xwayland/xwayland-dmabuf-bridge.c
++++ b/hw/xwayland/xwayland-dmabuf-bridge.c
+@@ -506,6 +506,7 @@
+ 
+     modifier = ((uint64_t) packet->planes[0].modifier_hi << 32) |
+                (uint64_t) packet->planes[0].modifier_lo;
++#ifdef XWL_HAS_GLAMOR
+     if (!xwl_glamor_is_modifier_supported(xwl_screen, packet->format, modifier)) {
+         ErrorF("xwayland dmabuf bridge: unsupported format/modifier format=0x%08x modifier=0x%016llx\n",
+                packet->format, (unsigned long long) modifier);
+@@ -513,6 +514,11 @@
+                                            XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
+         return FALSE;
+     }
++#else
++    xwl_dmabuf_bridge_send_feedback_fd(client->fd, packet->xid, packet->reserved,
++                                       XWL_DMABUF_BRIDGE_FEEDBACK_FAILED);
++    return FALSE;
++#endif
+ 
+     if (wl_display_flush(xwl_screen->display) < 0) {
+         if (errno == EAGAIN) {
