@@ -18,6 +18,8 @@ INSTALL_PREFIX="${WRAPPER_INSTALL_PREFIX:-/usr}"
 BUILD64_DIR="${WRAPPER_BUILD64_DIR:-${ROOT_DIR}/build64}"
 BUILD32_DIR="${WRAPPER_BUILD32_DIR:-${ROOT_DIR}/build32}"
 TOOLCHAIN_FILE="${WRAPPER_TOOLCHAIN_FILE:-${ROOT_DIR}/cmake/armhf_toolchain.cmake}"
+MALI_DRIVER_PATH_64="${WRAPPER_MALI_DRIVER_PATH_64:-/usr/lib/aarch64-linux-gnu/libmali.so}"
+MALI_DRIVER_PATH_32="${WRAPPER_MALI_DRIVER_PATH_32:-/usr/lib/arm-linux-gnueabihf/libmali.so}"
 JOBS="${WRAPPER_JOBS:-$(nproc)}"
 
 is_true() {
@@ -194,6 +196,8 @@ configure_interactive_options_if_requested() {
     echo "  reboot after install : ${REBOOT_AFTER_INSTALL}"
     echo "  install prefix       : ${INSTALL_PREFIX}"
     echo "  build type           : ${CMAKE_BUILD_TYPE}"
+    echo "  Mali driver 64-bit   : ${MALI_DRIVER_PATH_64}"
+    echo "  Mali driver 32-bit   : ${MALI_DRIVER_PATH_32}"
     echo
 
     if ! prompt_yes_no "Proceed?" "true"; then
@@ -254,6 +258,62 @@ install_build_dependencies_if_requested() {
 
     if is_true "${BUILD_32BIT}"; then
         run_as_root apt-get install -y "${cross_pkgs[@]}"
+    fi
+}
+
+print_mali_candidates() {
+    local path="$1"
+    local dir
+    local found=0
+    local candidate=""
+
+    dir="$(dirname "${path}")"
+    if [[ ! -d "${dir}" ]]; then
+        echo "    (directory missing: ${dir})"
+        return
+    fi
+
+    shopt -s nullglob
+    for candidate in "${dir}"/libmali*.so*; do
+        found=1
+        echo "    - ${candidate}"
+    done
+    shopt -u nullglob
+
+    if [[ "${found}" -eq 0 ]]; then
+        echo "    (none found in ${dir})"
+    fi
+}
+
+check_mali_driver_preflight() {
+    local missing=0
+
+    if is_true "${BUILD_64BIT}"; then
+        if [[ ! -e "${MALI_DRIVER_PATH_64}" ]]; then
+            echo "ERROR: 64-bit Mali driver not found: ${MALI_DRIVER_PATH_64}" >&2
+            echo "  64-bit candidates:" >&2
+            print_mali_candidates "${MALI_DRIVER_PATH_64}" >&2
+            missing=1
+        fi
+    fi
+
+    if is_true "${BUILD_32BIT}"; then
+        if [[ ! -e "${MALI_DRIVER_PATH_32}" ]]; then
+            echo "ERROR: 32-bit Mali driver not found: ${MALI_DRIVER_PATH_32}" >&2
+            echo "  32-bit candidates:" >&2
+            print_mali_candidates "${MALI_DRIVER_PATH_32}" >&2
+            missing=1
+        fi
+    fi
+
+    if [[ "${missing}" -ne 0 ]]; then
+        echo >&2
+        echo "Install Mali blobs first with:" >&2
+        echo "  ./scripts/mali/install_mali_blobs.sh" >&2
+        echo "Or override expected paths with:" >&2
+        echo "  WRAPPER_MALI_DRIVER_PATH_64=/path/to/libmali.so" >&2
+        echo "  WRAPPER_MALI_DRIVER_PATH_32=/path/to/libmali.so" >&2
+        exit 1
     fi
 }
 
@@ -453,6 +513,7 @@ configure_and_build_64() {
         -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
         -DBUILD_64BIT=ON \
         -DBUILD_32BIT=OFF \
+        -DMALI_DRIVER_PATH_64="${MALI_DRIVER_PATH_64}" \
         "${extra_args[@]}"
 
     echo "Building 64-bit wrapper"
@@ -485,6 +546,7 @@ configure_and_build_32() {
         -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
         -DBUILD_64BIT=OFF \
         -DBUILD_32BIT=ON \
+        -DMALI_DRIVER_PATH_32="${MALI_DRIVER_PATH_32}" \
         "${extra_args[@]}"
 
     echo "Building 32-bit wrapper"
@@ -616,6 +678,7 @@ done
 install_build_dependencies_if_requested
 warn_if_prefix_manifest_mismatch
 warn_if_vulkan_env_overrides_present
+check_mali_driver_preflight
 check_for_old_or_conflicting_installations
 prune_unselected_arch_installations_if_requested
 force_reinstall_selected_arch_if_requested

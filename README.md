@@ -20,38 +20,40 @@ Built specifically for RK3588 SoCs with Mali G610 (g24p0) using libmali drivers 
 
 **Important:** Install Mali drivers before building the wrapper to avoid conflicts.
 
-#### 64-bit Mali Driver
-
-Install the prebuilt Debian package:
+Recommended (scripted):
 ```bash
-# Download and install 64-bit Mali driver
+./scripts/mali/install_mali_blobs.sh
+```
+
+Useful non-interactive examples:
+```bash
+# Install only 64-bit Mali blob package
+MALI_INSTALL_INTERACTIVE=0 MALI_INSTALL_64BIT=1 MALI_INSTALL_32BIT=0 ./scripts/mali/install_mali_blobs.sh
+
+# Install both 64-bit and 32-bit Mali blobs
+MALI_INSTALL_INTERACTIVE=0 MALI_INSTALL_64BIT=1 MALI_INSTALL_32BIT=1 ./scripts/mali/install_mali_blobs.sh
+```
+
+The script removes known conflicting Vulkan files by default:
+- `/usr/share/vulkan/icd.d/mali.json`
+- `/usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.json`
+
+#### Manual Mali Driver Installation (Advanced)
+
+Use this only if you do not want the script.
+
+```bash
+# 64-bit package
 wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-04f8711/libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb
 sudo apt install ./libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb
-```
 
-#### 32-bit Mali Driver
-
-No prebuilt package exists, so download the binary directly:
-```bash
-
-# Download 32-bit Mali driver
+# 32-bit blob + libmali.so symlink
 sudo wget -O /usr/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so \
   https://github.com/ginkage/libmali-rockchip/raw/refs/heads/master/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so
+sudo ln -sf /usr/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so /usr/lib/arm-linux-gnueabihf/libmali.so
 
-# Create standard symlink (or keep original filename and use -DMALI_DRIVER_PATH_32 build option instead)
-sudo ln -sf /usr/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so \
-           /usr/lib/arm-linux-gnueabihf/libmali.so
-```
-
-#### Remove Conflicting Mali ICD (CRITICAL)
-
-**Most important:** Remove the default Mali ICD that gets installed with the driver package:
-
-```bash
-# Remove default Mali ICD (installed by .deb package) - THIS IS CRITICAL
+# Remove conflicting ICD/layer files
 sudo rm -f /usr/share/vulkan/icd.d/mali.json
-
-# Also remove standalone WSI layer to avoid conflicts (if installed)
 sudo rm -f /usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.json
 ```
 
@@ -61,13 +63,10 @@ sudo rm -f /usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.
 
 Complete the Mali Driver Installation above first.
 
-Recommended: let the wrapper script install build dependencies (apt-based systems):
-
-```bash
-./scripts/wrapper/build_wrapper.sh
-```
-
-When prompted, answer `yes` to dependency installation.
+`scripts/wrapper/build_wrapper.sh` now validates Mali driver paths before build:
+- 64-bit: `/usr/lib/aarch64-linux-gnu/libmali.so`
+- 32-bit: `/usr/lib/arm-linux-gnueabihf/libmali.so`
+- override with `WRAPPER_MALI_DRIVER_PATH_64` / `WRAPPER_MALI_DRIVER_PATH_32` if your paths differ
 
 ### Build and Install (Recommended)
 
@@ -75,6 +74,8 @@ Use the wrapper script:
 ```bash
 ./scripts/wrapper/build_wrapper.sh
 ```
+
+On apt-based systems, answer `yes` when prompted for dependency installation.
 
 Useful non-interactive examples:
 ```bash
