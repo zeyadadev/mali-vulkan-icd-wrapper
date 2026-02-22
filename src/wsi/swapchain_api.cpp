@@ -91,7 +91,6 @@ wsi_layer_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *
    }
 
    VkSwapchainCreateInfoKHR my_create_info = *pSwapchainCreateInfo;
-   my_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
    VkResult init_result = sc->init(device_data.device, &my_create_info);
    WSI_LOG_DEBUG("swapchain init result %d", init_result);
    if (init_result != VK_SUCCESS)
