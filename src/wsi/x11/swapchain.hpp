@@ -266,6 +266,7 @@ private:
    uint64_t m_bridge_present_interval_ns = 0;
    std::chrono::steady_clock::time_point m_bridge_next_present_time{};
    bool m_bridge_present_rate_limit_initialized = false;
+   bool m_bridge_present_fps_override = false;
    bool m_bridge_release_lag_logged = false;
    std::deque<uint32_t> m_bridge_pending_unpresent;
 

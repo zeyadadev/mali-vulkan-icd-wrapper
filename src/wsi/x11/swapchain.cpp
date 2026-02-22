@@ -33,6 +33,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -68,6 +69,11 @@ namespace x11
 {
 
 #define X11_SWAPCHAIN_MAX_PENDING_COMPLETIONS 128
+
+namespace
+{
+std::atomic<bool> g_disable_xwayland_bridge_runtime{ false };
+} // namespace
 
 static VkResult fill_image_create_info(VkImageCreateInfo &image_create_info,
                                        util::vector<VkSubresourceLayout> &image_plane_layouts,
@@ -164,7 +170,9 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
    }
 
    m_xwayland_bridge = xwayland_dmabuf_bridge_client::create_from_environment();
-   m_use_xwayland_bridge = (m_xwayland_bridge != nullptr) && m_xwayland_bridge->is_enabled();
+   const bool bridge_requested = (m_xwayland_bridge != nullptr) && m_xwayland_bridge->is_enabled();
+   const bool bridge_runtime_disabled = g_disable_xwayland_bridge_runtime.load(std::memory_order_acquire);
+   m_use_xwayland_bridge = bridge_requested && !bridge_runtime_disabled;
 
    if (m_use_xwayland_bridge)
    {
@@ -173,6 +181,12 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
    }
    else
    {
+      if (bridge_requested && bridge_runtime_disabled)
+      {
+         WSI_LOG_WARNING(
+            "Xwayland bridge disabled after a previous runtime failure. Using SHM presenter fallback for this swapchain.");
+      }
+
       try
       {
          m_shm_presenter = std::make_unique<shm_presenter>();
@@ -249,6 +263,7 @@ void swapchain::init_bridge_present_rate_limit()
          fps = static_cast<uint32_t>(parsed);
       }
    }
+   m_bridge_present_fps_override = has_env_override;
 
    if (!has_env_override)
    {
@@ -276,11 +291,26 @@ void swapchain::init_bridge_present_rate_limit()
    m_bridge_next_present_time = std::chrono::steady_clock::now();
    m_bridge_present_rate_limit_initialized = true;
    WSI_LOG_INFO("Xwayland bridge: present pacing enabled at %u FPS", fps);
+
+   if (!m_bridge_present_fps_override && m_xwayland_bridge && m_xwayland_bridge->is_feedback_sync_enabled())
+   {
+      WSI_LOG_INFO(
+         "Xwayland bridge: sync feedback active, using ack-based pacing (timer cap kept as fallback).");
+   }
 }
 
 void swapchain::throttle_bridge_present_if_needed()
 {
    if (!m_use_xwayland_bridge || m_bridge_present_interval_ns == 0)
+   {
+      return;
+   }
+
+   /*
+    * When feedback sync is available, present_frame() blocks on compositor ACKs.
+    * Let that path drive cadence; keep timer pacing as a fallback if feedback gets disabled.
+    */
+   if (!m_bridge_present_fps_override && m_xwayland_bridge && m_xwayland_bridge->is_feedback_sync_enabled())
    {
       return;
    }
@@ -841,8 +871,15 @@ void swapchain::present_image(const pending_present_request &pending_present)
                          static_cast<unsigned>(m_window), pending_present.image_index, image_data->width,
                          image_data->height, bridge_fourcc,
                          static_cast<unsigned long long>(m_image_creation_parameters.m_allocated_format.modifier));
-         present_result = VK_ERROR_SURFACE_LOST_KHR;
-         set_error_state(VK_ERROR_SURFACE_LOST_KHR);
+         present_result = VK_ERROR_OUT_OF_DATE_KHR;
+         set_error_state(VK_ERROR_OUT_OF_DATE_KHR);
+
+         const bool was_disabled = g_disable_xwayland_bridge_runtime.exchange(true, std::memory_order_acq_rel);
+         if (!was_disabled)
+         {
+            WSI_LOG_WARNING(
+               "Disabling Xwayland bridge for this process due to runtime failure. Recreate swapchain to continue on SHM path.");
+         }
       }
    }
    else
