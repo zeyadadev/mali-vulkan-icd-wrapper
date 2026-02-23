@@ -178,20 +178,6 @@ bool xwayland_dmabuf_bridge_client::present_frame(uint32_t xid, uint32_t width, 
       return true;
    }
 
-   /*
-    * Initial frames can legitimately take longer to receive feedback while
-    * the X11 window is being mapped/configured and the compositor establishes
-    * presentation cadence. Skipping wait during a short warmup avoids
-    * disabling sync feedback due to startup transients.
-    */
-   constexpr uint32_t sync_warmup_frames = 8;
-   if (packet.reserved <= sync_warmup_frames)
-   {
-      WSI_LOG_DEBUG("Xwayland bridge: skipping sync wait during warmup frame=%u/%u (xid=0x%x)",
-                    packet.reserved, sync_warmup_frames, xid);
-      return true;
-   }
-
    uint32_t feedback_flags = 0;
    uint32_t feedback_xid = 0;
    if (!wait_for_feedback(packet.reserved, m_feedback_timeout_ms, feedback_flags, feedback_xid))

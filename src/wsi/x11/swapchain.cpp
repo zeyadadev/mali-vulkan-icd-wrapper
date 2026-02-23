@@ -174,8 +174,30 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
    const bool bridge_runtime_disabled = g_disable_xwayland_bridge_runtime.load(std::memory_order_acquire);
    m_use_xwayland_bridge = bridge_requested && !bridge_runtime_disabled;
 
+   const char *allow_mailbox_env = std::getenv("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX");
+   const bool allow_mailbox = allow_mailbox_env && !(allow_mailbox_env[0] == '0' && allow_mailbox_env[1] == '\0');
+   if (m_use_xwayland_bridge &&
+       (m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR || m_present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) &&
+       !allow_mailbox)
+   {
+      WSI_LOG_WARNING(
+         "Xwayland bridge: forcing FIFO present mode for safety (set XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1 to keep requested mode).");
+      m_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+   }
+
    if (m_use_xwayland_bridge)
    {
+      constexpr size_t bridge_target_image_count = wsi::surface_properties::MAX_SWAPCHAIN_IMAGE_COUNT;
+      if (m_swapchain_images.size() < bridge_target_image_count)
+      {
+         if (!m_swapchain_images.try_resize(bridge_target_image_count))
+         {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+         WSI_LOG_INFO("Xwayland bridge: increasing swapchain image count to %zu for safer dmabuf reuse",
+                      m_swapchain_images.size());
+      }
+
       WSI_LOG_INFO("XWL_DMABUF_BRIDGE detected: using Xwayland dmabuf bridge presentation path");
       init_bridge_present_rate_limit();
    }
@@ -236,7 +258,7 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
 
 void swapchain::init_bridge_present_rate_limit()
 {
-   constexpr uint32_t default_fifo_fps = 60;
+   constexpr uint32_t default_bridge_fps = 60;
    constexpr uint32_t max_supported_fps = 240;
 
    bool has_env_override = false;
@@ -267,13 +289,12 @@ void swapchain::init_bridge_present_rate_limit()
 
    if (!has_env_override)
    {
-      /* FIFO-like modes must be paced to avoid flooding bridge imports and stalling desktop compositors. */
-      if (m_present_mode == VK_PRESENT_MODE_FIFO_KHR || m_present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
-          m_present_mode == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR ||
-          m_present_mode == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR)
-      {
-         fps = default_fifo_fps;
-      }
+      /*
+       * Bridge mode needs a conservative default cap independent of Vulkan present mode.
+       * IMMEDIATE/MAILBOX can otherwise recycle dmabufs too aggressively when feedback
+       * sync is unavailable, causing visible reuse artifacts.
+       */
+      fps = default_bridge_fps;
    }
 
    if (fps == 0)
@@ -295,22 +316,13 @@ void swapchain::init_bridge_present_rate_limit()
    if (!m_bridge_present_fps_override && m_xwayland_bridge && m_xwayland_bridge->is_feedback_sync_enabled())
    {
       WSI_LOG_INFO(
-         "Xwayland bridge: sync feedback active, using ack-based pacing (timer cap kept as fallback).");
+         "Xwayland bridge: sync feedback active; enforcing timer cap as an additional bridge safety bound.");
    }
 }
 
 void swapchain::throttle_bridge_present_if_needed()
 {
    if (!m_use_xwayland_bridge || m_bridge_present_interval_ns == 0)
-   {
-      return;
-   }
-
-   /*
-    * When feedback sync is available, present_frame() blocks on compositor ACKs.
-    * Let that path drive cadence; keep timer pacing as a fallback if feedback gets disabled.
-    */
-   if (!m_bridge_present_fps_override && m_xwayland_bridge && m_xwayland_bridge->is_feedback_sync_enabled())
    {
       return;
    }
@@ -901,6 +913,14 @@ void swapchain::present_image(const pending_present_request &pending_present)
    uint32_t image_index_to_unpresent = 0;
    bool should_unpresent = false;
 
+   if (m_use_xwayland_bridge && present_result == VK_SUCCESS)
+   {
+      /* Keep buffers unavailable to acquire until bridge pacing has been applied. */
+      thread_status_lock.unlock();
+      throttle_bridge_present_if_needed();
+      thread_status_lock.lock();
+   }
+
    if (!m_use_xwayland_bridge)
    {
       image_index_to_unpresent = pending_present.image_index;
@@ -913,11 +933,11 @@ void swapchain::present_image(const pending_present_request &pending_present)
        * Keep a small in-flight queue so we do not render into a buffer that
        * may still be sampled by the compositor.
        */
-      const size_t release_lag_frames = (m_swapchain_images.size() >= 3) ? 2u : 1u;
+      const size_t release_lag_frames = (m_swapchain_images.size() > 1) ? (m_swapchain_images.size() - 1) : 1u;
       if (!m_bridge_release_lag_logged)
       {
-         WSI_LOG_INFO("Xwayland bridge: delayed image release enabled (lag=%zu frame%s)", release_lag_frames,
-                      (release_lag_frames == 1) ? "" : "s");
+         WSI_LOG_INFO("Xwayland bridge: delayed image release enabled (lag=%zu frame%s, swapchain_images=%zu)",
+                      release_lag_frames, (release_lag_frames == 1) ? "" : "s", m_swapchain_images.size());
          m_bridge_release_lag_logged = true;
       }
       m_bridge_pending_unpresent.push_back(pending_present.image_index);
@@ -945,11 +965,6 @@ void swapchain::present_image(const pending_present_request &pending_present)
    m_thread_status_cond.notify_all();
 
    thread_status_lock.unlock();
-
-   if (m_use_xwayland_bridge && present_result == VK_SUCCESS)
-   {
-      throttle_bridge_present_if_needed();
-   }
 
    if (should_unpresent)
    {

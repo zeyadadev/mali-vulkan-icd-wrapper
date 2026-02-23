@@ -149,8 +149,9 @@ Runtime behavior:
 
 - `XWL_DMABUF_BRIDGE` set: use Xwayland dmabuf bridge path for X11 swapchains.
 - `XWL_DMABUF_BRIDGE_PREFER_LINEAR=1`: prefer `DRM_FORMAT_MOD_LINEAR` (default behavior now prefers non-linear modifiers when available).
-- `XWL_DMABUF_BRIDGE_MAX_FPS=<N>`: cap bridge present rate (`0` disables pacing, default is `60` for FIFO-like present modes).
+- `XWL_DMABUF_BRIDGE_MAX_FPS=<N>`: cap bridge present rate (`0` disables pacing, default is `60` in bridge mode when no override is set).
 - `XWL_DMABUF_BRIDGE_FEEDBACK_TIMEOUT_MS=<N>`: timeout for ACK-based frame feedback (default `250` ms) before falling back to timer pacing.
+- `XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1`: keep MAILBOX/IMMEDIATE mode in bridge path (default behavior coerces to FIFO for safety).
 - `XWL_DMABUF_BRIDGE` unset: use existing SHM presenter path.
 - `WSI_FORCE_SDL_WAYLAND=1`: force legacy SDL workaround path (for fallback testing only).
 
@@ -162,9 +163,9 @@ Runtime behavior:
   - `xwayland dmabuf bridge: compositor rejected dmabuf xid=... format=... modifier=... planes=... p0_offset=... p0_stride=...`
   - `xwayland dmabuf bridge: failed to commit created buffer xid=... format=... modifier=...`
 - The bridge now uses `zwp_linux_buffer_params_v1_create()` (non-fatal import path), so a bad frame should not terminate Xwayland.
-- With the updated Xwayland patch series, the bridge includes ACK-based feedback (`HELLO`/`FEEDBACK`) and the wrapper uses that for pacing; timer pacing remains as fallback.
+- With the updated Xwayland patch series, the bridge includes ACK-based feedback (`HELLO`/`FEEDBACK`) and the wrapper enforces timer-capped pacing in bridge mode.
   - ACK success is emitted on `wl_surface.frame` callback (present cadence signal).
-  - Wrapper log when active: `Xwayland bridge: sync feedback enabled (ack-based pacing)`
+  - Wrapper log when active: `Xwayland bridge: sync feedback active; enforcing timer cap as an additional bridge safety bound.`
   - Wrapper fallback log (old Xwayland): `Xwayland bridge: sync feedback unsupported by server, using fallback pacing`
 - If explicit linear import fails (`modifier=0x0`), patched Xwayland retries once with implicit modifier semantics (`DRM_FORMAT_MOD_INVALID`) and logs:
   - `xwayland dmabuf bridge: retrying linear import with implicit modifier ...`
