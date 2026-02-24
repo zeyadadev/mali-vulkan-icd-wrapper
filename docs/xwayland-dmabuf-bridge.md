@@ -151,7 +151,8 @@ Runtime behavior:
 - `XWL_DMABUF_BRIDGE_PREFER_LINEAR=1`: prefer `DRM_FORMAT_MOD_LINEAR` (default behavior now prefers non-linear modifiers when available).
 - `XWL_DMABUF_BRIDGE_MAX_FPS=<N>`: cap bridge present rate (`0` disables pacing, default is `60` in bridge mode when no override is set).
 - `XWL_DMABUF_BRIDGE_FEEDBACK_TIMEOUT_MS=<N>`: timeout for ACK-based frame feedback (default `250` ms) before falling back to timer pacing.
-- `XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1`: keep MAILBOX/IMMEDIATE mode in bridge path (default behavior coerces to FIFO for safety).
+- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep the app-selected present mode (MAILBOX/IMMEDIATE/etc.) for layer-owned X11 and Wayland swapchains (default behavior forces FIFO for compatibility).
+- `XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1`: legacy alias for bridge-specific setups (deprecated; prefer `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`).
 - `XWL_DMABUF_BRIDGE` unset: use existing SHM presenter path.
 - `WSI_FORCE_SDL_WAYLAND=1`: force legacy SDL workaround path (for fallback testing only).
 

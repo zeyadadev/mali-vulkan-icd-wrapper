@@ -73,6 +73,17 @@ namespace x11
 namespace
 {
 std::atomic<bool> g_disable_xwayland_bridge_runtime{ false };
+
+bool env_var_is_enabled(const char *value)
+{
+   return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+bool allow_non_fifo_present_mode()
+{
+   return env_var_is_enabled(std::getenv("WSI_ALLOW_NON_FIFO_PRESENT_MODE")) ||
+          env_var_is_enabled(std::getenv("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX"));
+}
 } // namespace
 
 static VkResult fill_image_create_info(VkImageCreateInfo &image_create_info,
@@ -174,14 +185,13 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
    const bool bridge_runtime_disabled = g_disable_xwayland_bridge_runtime.load(std::memory_order_acquire);
    m_use_xwayland_bridge = bridge_requested && !bridge_runtime_disabled;
 
-   const char *allow_mailbox_env = std::getenv("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX");
-   const bool allow_mailbox = allow_mailbox_env && !(allow_mailbox_env[0] == '0' && allow_mailbox_env[1] == '\0');
+   const bool allow_non_fifo_mode = allow_non_fifo_present_mode();
    if (m_use_xwayland_bridge &&
        (m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR || m_present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) &&
-       !allow_mailbox)
+       !allow_non_fifo_mode)
    {
       WSI_LOG_WARNING(
-         "Xwayland bridge: forcing FIFO present mode for safety (set XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1 to keep requested mode).");
+         "Xwayland bridge: forcing FIFO present mode for safety (set WSI_ALLOW_NON_FIFO_PRESENT_MODE=1 to keep requested mode).");
       m_present_mode = VK_PRESENT_MODE_FIFO_KHR;
    }
 
