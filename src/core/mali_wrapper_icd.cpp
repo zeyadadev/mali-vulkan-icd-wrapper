@@ -25,6 +25,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cerrno>
+#include <fcntl.h>
+#include <execinfo.h>
+#include <signal.h>
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -388,10 +391,45 @@ static bool IsWSIFunction(const char* name) {
     return wsi_functions.find(name) != wsi_functions.end();
 }
 
+static void crash_signal_handler(int sig, siginfo_t* info, void* /*ctx*/)
+{
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    // Use write() - async-signal-safe unlike fprintf
+    const char* header = "[mali-wrapper] CRASH SIGNAL ";
+    write(STDERR_FILENO, header, __builtin_strlen(header));
+    char sigbuf[4];
+    int len = 0;
+    int s = sig;
+    if (s == 0) { sigbuf[len++] = '0'; }
+    else { while (s > 0) { sigbuf[len++] = '0' + (s % 10); s /= 10; } }
+    // reverse
+    for (int i = 0, j = len-1; i < j; i++, j--) { char t = sigbuf[i]; sigbuf[i] = sigbuf[j]; sigbuf[j] = t; }
+    write(STDERR_FILENO, sigbuf, len);
+    write(STDERR_FILENO, "\n", 1);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    // Re-raise with default handler to produce core dump
+    struct sigaction sa{};
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
+}
+
 bool InitializeWrapper() {
     if (getenv("MALI_WRAPPER_DEBUG")) {
         Logger::Instance().SetLevel(LogLevel::DEBUG);
         }
+
+    // Install crash handler to get backtraces on segfault/abort
+    struct sigaction sa{};
+    sa.sa_sigaction = crash_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+    sigaction(SIGILL,  &sa, nullptr);
 
     LOG_INFO("Initializing Mali Wrapper ICD");
 
