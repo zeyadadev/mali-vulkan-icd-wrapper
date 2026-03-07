@@ -1,4 +1,4 @@
-# Xwayland dmabuf bridge (experimental)
+# Xwayland dmabuf bridge
 
 This repository carries an out-of-tree Xwayland patch series for a single-window X11 zero-copy path over Wayland.
 

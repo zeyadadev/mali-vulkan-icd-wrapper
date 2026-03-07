@@ -12,7 +12,7 @@ Mali's Vulkan drivers come in separate 32-bit and 64-bit flavors, and the Window
 - **No config files**: Everything's baked in at build time
 - **Drop-in replacement**: Just install and go
 
-Built specifically for RK3588 SoCs with Mali G610 (g24p0) using libmali drivers from [tsukumijima/libmali-rockchip](https://github.com/tsukumijima/libmali-rockchip). Developed and tested on Armbian Ubuntu Noble with GNOME/Wayland.
+Built specifically for RK3588 SoCs with Mali G610 using libmali drivers from [tsukumijima/libmali-rockchip](https://github.com/tsukumijima/libmali-rockchip). Supports g24p0 (system-installed for desktop acceleration) and g29p1 (extracted for Vulkan apps). Developed and tested on Armbian Ubuntu Noble with GNOME/Wayland.
 
 ## Quick Start
 
@@ -25,27 +25,38 @@ Recommended (scripted):
 ./scripts/mali/install_mali_blobs.sh
 ```
 
+By default, the script:
+- **Installs the g24 blob** (`apt install`) — needed for desktop acceleration (system `libmali.so`)
+- **Extracts the g29p1 blob** to `/opt/mali-g29p1` — newer driver for Vulkan apps, without replacing the system g24
+- **Removes known conflicting Vulkan files** (`mali.json`, legacy WSI layer JSON)
+
 Useful non-interactive examples:
 ```bash
-# Install only 64-bit Mali blob package
-MALI_INSTALL_INTERACTIVE=0 MALI_INSTALL_64BIT=1 MALI_INSTALL_32BIT=0 ./scripts/mali/install_mali_blobs.sh
+# Install g24 + extract g29p1 (default behavior)
+MALI_INSTALL_INTERACTIVE=0 ./scripts/mali/install_mali_blobs.sh
 
-# Install both 64-bit and 32-bit Mali blobs
-MALI_INSTALL_INTERACTIVE=0 MALI_INSTALL_64BIT=1 MALI_INSTALL_32BIT=1 ./scripts/mali/install_mali_blobs.sh
+# Also install 32-bit Mali blob
+MALI_INSTALL_INTERACTIVE=0 MALI_INSTALL_32BIT=1 ./scripts/mali/install_mali_blobs.sh
+
+# Only install g24, skip g29p1 extraction
+MALI_INSTALL_INTERACTIVE=0 MALI_EXTRACT_G29_64BIT=0 ./scripts/mali/install_mali_blobs.sh
 ```
 
-The script removes known conflicting Vulkan files by default:
-- `/usr/share/vulkan/icd.d/mali.json`
-- `/usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.json`
-
-#### Manual Mali Driver Installation (Advanced)
+#### Manual Mali Driver Installation
 
 Use this only if you do not want the script.
 
 ```bash
-# 64-bit package
+# 64-bit g24 package (system install for desktop acceleration)
 wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-04f8711/libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb
 sudo apt install ./libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb
+
+# 64-bit g29p1 package (extract only for Vulkan apps)
+wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-54646ed/libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb
+sudo mkdir -p /opt/mali-g29p1
+sudo dpkg-deb -x libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb /opt/mali-g29p1
+sudo ln -sf /opt/mali-g29p1/usr/lib/aarch64-linux-gnu/libmali-valhall-g610-g29p1-*.so \
+  /opt/mali-g29p1/usr/lib/aarch64-linux-gnu/libmali.so
 
 # 32-bit blob + libmali.so symlink
 sudo wget -O /usr/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so \
@@ -63,12 +74,14 @@ sudo rm -f /usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.
 
 Complete the Mali Driver Installation above first.
 
-`scripts/wrapper/build_wrapper.sh` now validates Mali driver paths before build:
-- 64-bit: `/usr/lib/aarch64-linux-gnu/libmali.so`
+`scripts/wrapper/build_wrapper.sh` validates Mali driver paths before build:
+- 64-bit: `/usr/lib/aarch64-linux-gnu/libmali.so` (system g24) or `/opt/mali-g29p1/usr/lib/aarch64-linux-gnu/libmali.so` (extracted g29p1)
 - 32-bit: `/usr/lib/arm-linux-gnueabihf/libmali.so`
 - override with `WRAPPER_MALI_DRIVER_PATH_64` / `WRAPPER_MALI_DRIVER_PATH_32` if your paths differ
 
-### Build and Install (Recommended)
+In interactive mode, the build script auto-detects the extracted g29p1 blob and asks which driver to build against.
+
+### Build and Install
 
 Use the wrapper script:
 ```bash
@@ -105,7 +118,7 @@ When `WRAPPER_INSTALL_SYSTEM=1` (default), the script automatically:
 
 If the script adds your user to a new dma_heap access group, log out and back in once for group membership to take effect.
 
-### Manual CMake (Advanced)
+### Manual CMake
 
 Only needed for custom CI/packaging flows. The script above is the recommended path.
 
@@ -164,12 +177,17 @@ file /usr/lib/arm-linux-gnueabihf/libmali_wrapper.so   # 32-bit
 | `ENABLE_WAYLAND_FIFO_PRESENTATION_THREAD` | Use FIFO presentation thread | ON |
 | `SELECT_EXTERNAL_ALLOCATOR` | External memory allocator backend | `dma_buf_heaps` |
 
-## Experimental: X11 zero-copy via patched Xwayland
+### X11 Zero-Copy (Patched Xwayland)
 
-This repo includes an optional out-of-tree Xwayland dmabuf bridge flow for experimental X11 zero-copy presentation.
+For X11 apps running under Wayland, the wrapper includes a dmabuf bridge that enables zero-copy presentation through a patched Xwayland. This avoids the default SHM copy path.
 
-- Build helper: `scripts/xwayland/build_patched_xwayland.sh`
-- Full setup/runtime/rollback guide: `docs/xwayland-dmabuf-bridge.md`
+```bash
+./scripts/xwayland/build_patched_xwayland.sh
+```
+
+In interactive mode, the script prompts to install the patched binary to `/usr/bin/Xwayland` and configure the bridge socket environment. Log out and back in after install.
+
+Full setup, runtime options, and rollback guide: [docs/xwayland-dmabuf-bridge.md](docs/xwayland-dmabuf-bridge.md)
 
 ## Debugging
 
@@ -207,7 +225,7 @@ No configuration files, no runtime detection, no architecture mismatches.
 - **Kernel**: 6.1.115-vendor-rk35xx
 - **OS**: Armbian Ubuntu Noble (24.04)
 - **Desktop**: GNOME with Wayland
-- **Mali Drivers**: libmali-rockchip v1.9-1 (g24p0)
+- **Mali Drivers**: libmali-rockchip v1.9-1 (g24p0 for desktop, g29p1 for Vulkan apps)
 
 ## Credits
 
