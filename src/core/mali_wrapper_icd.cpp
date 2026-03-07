@@ -391,8 +391,15 @@ static bool IsWSIFunction(const char* name) {
     return wsi_functions.find(name) != wsi_functions.end();
 }
 
+static bool should_install_crash_handler()
+{
+    // Keep crash handler opt-in because it can interfere with app/runtime handlers.
+    return is_bool_env_enabled("MALI_WRAPPER_CRASH_SIGNAL_HANDLER", false);
+}
+
 static void crash_signal_handler(int sig, siginfo_t* info, void* /*ctx*/)
 {
+    (void)info;
     void* frames[64];
     int n = backtrace(frames, 64);
     // Use write() - async-signal-safe unlike fprintf
@@ -419,17 +426,19 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* /*ctx*/)
 bool InitializeWrapper() {
     if (getenv("MALI_WRAPPER_DEBUG")) {
         Logger::Instance().SetLevel(LogLevel::DEBUG);
-        }
+    }
 
-    // Install crash handler to get backtraces on segfault/abort
-    struct sigaction sa{};
-    sa.sa_sigaction = crash_signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGBUS,  &sa, nullptr);
-    sigaction(SIGILL,  &sa, nullptr);
+    if (should_install_crash_handler()) {
+        struct sigaction sa{};
+        sa.sa_sigaction = crash_signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        sigaction(SIGSEGV, &sa, nullptr);
+        sigaction(SIGABRT, &sa, nullptr);
+        sigaction(SIGBUS,  &sa, nullptr);
+        sigaction(SIGILL,  &sa, nullptr);
+        LOG_INFO("Crash signal handler enabled (MALI_WRAPPER_CRASH_SIGNAL_HANDLER)");
+    }
 
     LOG_INFO("Initializing Mali Wrapper ICD");
 
