@@ -20,6 +20,7 @@ BUILD32_DIR="${WRAPPER_BUILD32_DIR:-${ROOT_DIR}/build32}"
 TOOLCHAIN_FILE="${WRAPPER_TOOLCHAIN_FILE:-${ROOT_DIR}/cmake/armhf_toolchain.cmake}"
 MALI_DRIVER_PATH_64="${WRAPPER_MALI_DRIVER_PATH_64:-/usr/lib/aarch64-linux-gnu/libmali.so}"
 MALI_DRIVER_PATH_32="${WRAPPER_MALI_DRIVER_PATH_32:-/usr/lib/arm-linux-gnueabihf/libmali.so}"
+MALI_G29_64_EXTRACT_DIR="${MALI_G29_64_EXTRACT_DIR:-/opt/mali-g29p1}"
 JOBS="${WRAPPER_JOBS:-$(nproc)}"
 CONFIGURE_DMA_HEAP_UDEV="${WRAPPER_CONFIGURE_DMA_HEAP_UDEV:-true}"
 DMA_HEAP_ADD_USER_TO_GROUP="${WRAPPER_DMA_HEAP_ADD_USER_TO_GROUP:-true}"
@@ -137,6 +138,17 @@ configure_interactive_options_if_requested() {
 
     if prompt_yes_no "Build 64-bit wrapper?" "${BUILD_64BIT}"; then
         BUILD_64BIT="true"
+
+        local g29_libmali="${MALI_G29_64_EXTRACT_DIR}/usr/lib/aarch64-linux-gnu/libmali.so"
+        if [[ -e "${g29_libmali}" ]]; then
+            echo ""
+            echo "  Detected extracted g29p1 blob at: ${g29_libmali}"
+            echo "  System g24 blob at:               /usr/lib/aarch64-linux-gnu/libmali.so"
+            echo ""
+            if prompt_yes_no "  Use g29p1 for Vulkan apps (instead of system g24)?" "true"; then
+                MALI_DRIVER_PATH_64="${g29_libmali}"
+            fi
+        fi
     else
         BUILD_64BIT="false"
     fi
