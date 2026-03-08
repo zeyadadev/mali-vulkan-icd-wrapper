@@ -208,6 +208,38 @@ export MALI_WRAPPER_LOG_CONSOLE=1
 export MALI_WRAPPER_LOG_FILE=/tmp/mali_wrapper.log
 ```
 
+### DXVK Compatibility Spoof (Experimental)
+
+Some Mali blobs report required DXVK features as unsupported (for example `fillModeNonSolid`, `multiViewport`, `shaderClipDistance`, `shaderCullDistance`, and `robustBufferAccess2`), which causes adapter rejection.
+
+You can opt-in to a wrapper spoof that advertises selected features to applications while masking them back off when creating the real device:
+
+```bash
+# Enable DXVK-oriented feature spoof bundle
+export MALI_WRAPPER_FAKE_DXVK_FEATURES=1
+
+# Or enable only fillModeNonSolid spoof explicitly
+export MALI_WRAPPER_FAKE_FILL_MODE_NON_SOLID=1
+
+# Or enable only multiViewport spoof explicitly
+export MALI_WRAPPER_FAKE_MULTI_VIEWPORT=1
+
+# Or enable only shader clip/cull distance spoof explicitly
+export MALI_WRAPPER_FAKE_SHADER_CLIP_DISTANCE=1
+export MALI_WRAPPER_FAKE_SHADER_CULL_DISTANCE=1
+
+# Or enable only VK_EXT_robustness2 robustBufferAccess2 spoof explicitly
+export MALI_WRAPPER_FAKE_ROBUST_BUFFER_ACCESS_2=1
+```
+
+Notes:
+- This is a compatibility hack, not a hardware capability upgrade.
+- If a game actually relies on spoofed features, behavior may still be incorrect.
+
+Additional compatibility toggles:
+- `MALI_WRAPPER_FILTER_EXTERNAL_MEMORY_HOST=1`: hide `VK_EXT_external_memory_host` from device extension enumeration and remove it from `vkCreateDevice` extension lists.
+- `MALI_WRAPPER_LOW_ADDRESS_MAP=1`: force low-address shadow mappings for `vkMapMemory`/`vkMapMemory2` to keep pointers 32-bit compatible.
+
 ## How It Works
 
 1. **Build time**: CMake bakes Mali driver paths into each architecture-specific wrapper
