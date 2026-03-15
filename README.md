@@ -52,7 +52,7 @@ wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-04f871
 sudo apt install ./libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb
 
 # 64-bit g29p1 package (extract only for Vulkan apps)
-wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-54646ed/libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb
+wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-4b399ed/libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb
 sudo mkdir -p /opt/mali-g29p1
 sudo dpkg-deb -x libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb /opt/mali-g29p1
 sudo ln -sf /opt/mali-g29p1/usr/lib/aarch64-linux-gnu/libmali-valhall-g610-g29p1-*.so \
