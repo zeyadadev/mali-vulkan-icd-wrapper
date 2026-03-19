@@ -107,14 +107,6 @@ static bool is_bool_env_enabled(const char* name, bool default_value)
     return true;
 }
 
-static bool is_box64_environment()
-{
-    return getenv("BOX64_PATH") != nullptr ||
-           getenv("BOX64_LD_LIBRARY_PATH") != nullptr ||
-           getenv("BOX64_NOBANNER") != nullptr ||
-           getenv("BOX64_DYNAREC") != nullptr;
-}
-
 static bool should_use_low_address_shadow_map()
 {
     static int cached = -1;
@@ -122,32 +114,7 @@ static bool should_use_low_address_shadow_map()
         return cached == 1;
     }
 
-    const bool forced = getenv("MALI_WRAPPER_LOW_ADDRESS_MAP") != nullptr;
-    if (forced) {
-        cached = is_bool_env_enabled("MALI_WRAPPER_LOW_ADDRESS_MAP", false) ? 1 : 0;
-        return cached == 1;
-    }
-
-    bool auto_enable = getenv("WINEWOW64") != nullptr || getenv("WINE_WOW64") != nullptr;
-
-    // Some Wine+Box64 setups do not export WINEWOW64/WINE_WOW64.
-    // In that case, detect only likely WoW64 sessions heuristically.
-    if (!auto_enable) {
-        const bool has_wine_env =
-            getenv("WINEPREFIX") != nullptr ||
-            getenv("WINELOADER") != nullptr ||
-            getenv("WINELOADERNOEXEC") != nullptr ||
-            getenv("WINEDLLPATH") != nullptr;
-        const bool has_box64_env = is_box64_environment();
-        const char* wine_arch = getenv("WINEARCH");
-        const bool is_win32_prefix = wine_arch != nullptr && strcmp(wine_arch, "win32") == 0;
-        auto_enable = has_wine_env && has_box64_env && is_win32_prefix;
-    }
-
-    cached = auto_enable ? 1 : 0;
-    if (cached == 1) {
-        LOG_WARN("Low-address memory map workaround auto-enabled for Wine compatibility");
-    }
+    cached = is_bool_env_enabled("MALI_WRAPPER_LOW_ADDRESS_MAP", false) ? 1 : 0;
     return cached == 1;
 }
 

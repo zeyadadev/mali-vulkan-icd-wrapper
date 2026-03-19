@@ -238,7 +238,7 @@ Notes:
 
 Additional compatibility toggles:
 - `MALI_WRAPPER_FILTER_EXTERNAL_MEMORY_HOST=1`: hide `VK_EXT_external_memory_host` from device extension enumeration and remove it from `vkCreateDevice` extension lists.
-- `MALI_WRAPPER_LOW_ADDRESS_MAP=1`: force low-address shadow mappings for `vkMapMemory`/`vkMapMemory2` to keep pointers 32-bit compatible.
+- `MALI_WRAPPER_LOW_ADDRESS_MAP=1`: explicitly enable low-address shadow mappings for `vkMapMemory`/`vkMapMemory2` to keep pointers 32-bit compatible. If unset, the workaround stays disabled.
 
 ## How It Works
 
