@@ -4,6 +4,7 @@
 #include <fstream>
 #include <memory>
 #include <cstdarg>
+#include <cstdint>
 
 namespace mali_wrapper {
 
@@ -14,11 +15,13 @@ enum class LogLevel {
     DEBUG = 3
 };
 
-enum class LogCategory {
+enum class LogCategory : uint32_t {
     NONE = 0,
-    WRAPPER = 1,
-    WSI_LAYER = 2,
-    WRAPPER_WSI = 3
+    WRAPPER = 1u << 0,
+    WSI_LAYER = 1u << 1,
+    LOW_ADDRESS_MAP = 1u << 2,
+    WRAPPER_WSI = (1u << 0) | (1u << 1),
+    ALL = (1u << 0) | (1u << 1) | (1u << 2)
 };
 
 class Logger {
@@ -43,8 +46,13 @@ public:
     void WsiWarn(const std::string& message);
     void WsiInfo(const std::string& message);
     void WsiDebug(const std::string& message);
+    void LowAddressError(const std::string& message);
+    void LowAddressWarn(const std::string& message);
+    void LowAddressInfo(const std::string& message);
+    void LowAddressDebug(const std::string& message);
 
     void WsiLogF(LogLevel level, const char* format, ...);
+    void LowAddressLogF(LogLevel level, const char* format, ...);
     
 private:
     Logger();
@@ -60,13 +68,13 @@ private:
     std::string GetResetCode() const;
 
     LogLevel level_ = LogLevel::ERROR;
-    LogCategory category_ = LogCategory::WRAPPER_WSI;
+    LogCategory category_ = LogCategory::ALL;
     std::unique_ptr<std::ofstream> file_stream_;
     bool console_enabled_ = true;
     bool colors_enabled_ = true;
 
     const char* LevelToString(LogLevel level);
-    const char* CategoryToString(LogCategory category);
+    std::string CategoryToString(LogCategory category) const;
     void LogCategoryWarning(const char* invalid_category);
 };
 
@@ -81,6 +89,11 @@ private:
 #define WSI_LOG_WARNING(format, ...) mali_wrapper::Logger::Instance().WsiLogF(mali_wrapper::LogLevel::WARN, format, ##__VA_ARGS__)
 #define WSI_LOG_INFO(format, ...) mali_wrapper::Logger::Instance().WsiLogF(mali_wrapper::LogLevel::INFO, format, ##__VA_ARGS__)
 #define WSI_LOG_DEBUG(format, ...) mali_wrapper::Logger::Instance().WsiLogF(mali_wrapper::LogLevel::DEBUG, format, ##__VA_ARGS__)
+
+#define LOW_ADDRESS_LOG_ERROR(msg) mali_wrapper::Logger::Instance().LowAddressError(msg)
+#define LOW_ADDRESS_LOG_WARN(msg) mali_wrapper::Logger::Instance().LowAddressWarn(msg)
+#define LOW_ADDRESS_LOG_INFO(msg) mali_wrapper::Logger::Instance().LowAddressInfo(msg)
+#define LOW_ADDRESS_LOG_DEBUG(msg) mali_wrapper::Logger::Instance().LowAddressDebug(msg)
 
 #define WSI_LOG(level, format, ...) \
     do { \

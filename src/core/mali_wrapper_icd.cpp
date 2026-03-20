@@ -14,12 +14,14 @@
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
+#include <cinttypes>
 #include <dlfcn.h>
 #include <cstdio>
 #include <memory>
 #include <string>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 #include <limits>
 #include <cstdint>
 #include <sys/mman.h>
@@ -75,9 +77,75 @@ struct ShadowMappingInfo {
     VkDeviceSize mapped_size = 0;
 };
 
+enum class ShadowAllocationMethod {
+    NONE = 0,
+    MAP_32BIT = 1,
+    FIXED_SEARCH = 2,
+};
+
+enum class LowAddressCopyKind {
+    MAP_TO_SHADOW = 0,
+    FLUSH_TO_REAL = 1,
+    INVALIDATE_TO_SHADOW = 2,
+    SUBMIT_TO_REAL = 3,
+    UNMAP_TO_REAL = 4,
+};
+
+struct ShadowAllocationResult {
+    void* ptr = nullptr;
+    size_t size = 0;
+    ShadowAllocationMethod method = ShadowAllocationMethod::NONE;
+    uint32_t fixed_search_attempts = 0;
+    int last_errno = 0;
+    uint64_t elapsed_ns = 0;
+};
+
+struct LowAddressMapStats {
+    std::atomic<uint64_t> successful_maps{0};
+    std::atomic<uint64_t> compatible_maps{0};
+    std::atomic<uint64_t> high_pointer_maps{0};
+    std::atomic<uint64_t> shadow_maps{0};
+    std::atomic<uint64_t> disabled_high_pointer_maps{0};
+    std::atomic<uint64_t> resolve_failures{0};
+    std::atomic<uint64_t> unsupported_size_failures{0};
+    std::atomic<uint64_t> allocation_failures{0};
+    std::atomic<uint64_t> map32bit_allocations{0};
+    std::atomic<uint64_t> fixed_search_allocations{0};
+    std::atomic<uint64_t> fixed_search_attempts{0};
+    std::atomic<uint64_t> active_shadow_maps{0};
+    std::atomic<uint64_t> peak_shadow_maps{0};
+    std::atomic<uint64_t> active_shadow_bytes{0};
+    std::atomic<uint64_t> peak_shadow_bytes{0};
+    std::atomic<uint64_t> total_shadow_bytes_reserved{0};
+    std::atomic<uint64_t> initial_copy_bytes{0};
+    std::atomic<uint64_t> flush_copy_bytes{0};
+    std::atomic<uint64_t> invalidate_copy_bytes{0};
+    std::atomic<uint64_t> submit_copy_bytes{0};
+    std::atomic<uint64_t> unmap_copy_bytes{0};
+    std::atomic<uint64_t> allocation_time_ns{0};
+    std::atomic<uint64_t> copy_time_ns{0};
+};
+
+struct LowAddressMapReportSnapshot {
+    uint64_t successful_maps = 0;
+    uint64_t compatible_maps = 0;
+    uint64_t high_pointer_maps = 0;
+    uint64_t shadow_maps = 0;
+    uint64_t disabled_high_pointer_maps = 0;
+    uint64_t allocation_failures = 0;
+    uint64_t active_shadow_maps = 0;
+    uint64_t active_shadow_bytes = 0;
+    uint64_t total_copy_bytes = 0;
+};
+
 static std::mutex memory_tracking_mutex;
 static std::unordered_map<DeviceMemoryKey, VkDeviceSize, DeviceMemoryKeyHash> tracked_memory_allocations;
 static std::unordered_map<DeviceMemoryKey, ShadowMappingInfo, DeviceMemoryKeyHash> shadow_mappings;
+static LowAddressMapStats low_address_map_stats;
+static std::mutex low_address_map_report_mutex;
+static bool low_address_map_report_initialized = false;
+static LowAddressMapReportSnapshot low_address_map_last_report_snapshot;
+static std::chrono::steady_clock::time_point low_address_map_last_report_time;
 static std::mutex graphics_pipeline_signal_guard_mutex;
 static thread_local sigjmp_buf graphics_pipeline_signal_guard_env;
 static thread_local volatile sig_atomic_t graphics_pipeline_signal_guard_active = 0;
@@ -107,6 +175,28 @@ static bool is_bool_env_enabled(const char* name, bool default_value)
     return true;
 }
 
+static int get_low_address_map_debug_level()
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+
+    const char* value = getenv("MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG");
+    if (value == nullptr || value[0] == '\0') {
+        cached = 0;
+        return cached;
+    }
+
+    if (value[0] >= '0' && value[0] <= '9') {
+        cached = std::max(0, std::atoi(value));
+        return cached;
+    }
+
+    cached = is_bool_env_enabled("MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG", false) ? 1 : 0;
+    return cached;
+}
+
 static bool should_use_low_address_shadow_map()
 {
     static int cached = -1;
@@ -116,6 +206,394 @@ static bool should_use_low_address_shadow_map()
 
     cached = is_bool_env_enabled("MALI_WRAPPER_LOW_ADDRESS_MAP", false) ? 1 : 0;
     return cached == 1;
+}
+
+static bool should_collect_low_address_map_stats()
+{
+    return get_low_address_map_debug_level() > 0;
+}
+
+static bool should_trace_low_address_map_events()
+{
+    return get_low_address_map_debug_level() > 1;
+}
+
+static void update_peak_stat(std::atomic<uint64_t>& peak, uint64_t value)
+{
+    uint64_t current = peak.load(std::memory_order_relaxed);
+    while (current < value &&
+           !peak.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+    }
+}
+
+static std::string format_bytes(uint64_t bytes)
+{
+    char buffer[64];
+    const double kib = 1024.0;
+    const double mib = kib * 1024.0;
+    const double gib = mib * 1024.0;
+
+    if (bytes >= static_cast<uint64_t>(gib)) {
+        std::snprintf(buffer, sizeof(buffer), "%.2f GiB", static_cast<double>(bytes) / gib);
+    } else if (bytes >= static_cast<uint64_t>(mib)) {
+        std::snprintf(buffer, sizeof(buffer), "%.2f MiB", static_cast<double>(bytes) / mib);
+    } else if (bytes >= static_cast<uint64_t>(kib)) {
+        std::snprintf(buffer, sizeof(buffer), "%.2f KiB", static_cast<double>(bytes) / kib);
+    } else {
+        std::snprintf(buffer, sizeof(buffer), "%" PRIu64 " B", bytes);
+    }
+
+    return std::string(buffer);
+}
+
+static std::string format_duration_ms(uint64_t nanoseconds)
+{
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "%.3f ms", static_cast<double>(nanoseconds) / 1000000.0);
+    return std::string(buffer);
+}
+
+static std::string format_pointer(const void* ptr)
+{
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%p", ptr);
+    return std::string(buffer);
+}
+
+static std::string format_hex_u64(uint64_t value)
+{
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "0x%" PRIx64, value);
+    return std::string(buffer);
+}
+
+static std::string format_device_memory_handle(VkDeviceMemory memory)
+{
+#if defined(VK_USE_64_BIT_PTR_DEFINES) && (VK_USE_64_BIT_PTR_DEFINES == 1)
+    return format_pointer(memory);
+#else
+    return format_hex_u64(static_cast<uint64_t>(memory));
+#endif
+}
+
+static const char* shadow_allocation_method_to_string(ShadowAllocationMethod method)
+{
+    switch (method) {
+        case ShadowAllocationMethod::MAP_32BIT:
+            return "MAP_32BIT";
+        case ShadowAllocationMethod::FIXED_SEARCH:
+            return "fixed-search";
+        case ShadowAllocationMethod::NONE:
+        default:
+            return "none";
+    }
+}
+
+static const char* low_address_copy_kind_to_string(LowAddressCopyKind kind)
+{
+    switch (kind) {
+        case LowAddressCopyKind::MAP_TO_SHADOW:
+            return "map-to-shadow";
+        case LowAddressCopyKind::FLUSH_TO_REAL:
+            return "flush-to-real";
+        case LowAddressCopyKind::INVALIDATE_TO_SHADOW:
+            return "invalidate-to-shadow";
+        case LowAddressCopyKind::SUBMIT_TO_REAL:
+            return "submit-to-real";
+        case LowAddressCopyKind::UNMAP_TO_REAL:
+            return "unmap-to-real";
+        default:
+            return "unknown";
+    }
+}
+
+static void record_low_address_copy(LowAddressCopyKind kind, size_t size, uint64_t elapsed_ns)
+{
+    if (!should_collect_low_address_map_stats() || size == 0) {
+        return;
+    }
+
+    low_address_map_stats.copy_time_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+    switch (kind) {
+        case LowAddressCopyKind::MAP_TO_SHADOW:
+            low_address_map_stats.initial_copy_bytes.fetch_add(size, std::memory_order_relaxed);
+            break;
+        case LowAddressCopyKind::FLUSH_TO_REAL:
+            low_address_map_stats.flush_copy_bytes.fetch_add(size, std::memory_order_relaxed);
+            break;
+        case LowAddressCopyKind::INVALIDATE_TO_SHADOW:
+            low_address_map_stats.invalidate_copy_bytes.fetch_add(size, std::memory_order_relaxed);
+            break;
+        case LowAddressCopyKind::SUBMIT_TO_REAL:
+            low_address_map_stats.submit_copy_bytes.fetch_add(size, std::memory_order_relaxed);
+            break;
+        case LowAddressCopyKind::UNMAP_TO_REAL:
+            low_address_map_stats.unmap_copy_bytes.fetch_add(size, std::memory_order_relaxed);
+            break;
+    }
+}
+
+static void tracked_memcpy(void* dst, const void* src, size_t size, LowAddressCopyKind kind)
+{
+    if (size == 0) {
+        return;
+    }
+
+    if (!should_collect_low_address_map_stats()) {
+        std::memcpy(dst, src, size);
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    std::memcpy(dst, src, size);
+    const uint64_t elapsed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    record_low_address_copy(kind, size, elapsed_ns);
+
+    if (should_trace_low_address_map_events()) {
+        LOW_ADDRESS_LOG_DEBUG("Low-address copy: kind=" +
+                              std::string(low_address_copy_kind_to_string(kind)) +
+                              ", size=" + format_bytes(static_cast<uint64_t>(size)) +
+                              ", src=" + format_pointer(src) +
+                              ", dst=" + format_pointer(dst) +
+                              ", elapsed=" + format_duration_ms(elapsed_ns));
+    }
+}
+
+static void record_shadow_mapping_installed(size_t new_shadow_size,
+                                            size_t replaced_shadow_size,
+                                            const ShadowAllocationResult& allocation)
+{
+    if (!should_collect_low_address_map_stats()) {
+        return;
+    }
+
+    low_address_map_stats.shadow_maps.fetch_add(1, std::memory_order_relaxed);
+    low_address_map_stats.total_shadow_bytes_reserved.fetch_add(new_shadow_size, std::memory_order_relaxed);
+    low_address_map_stats.allocation_time_ns.fetch_add(allocation.elapsed_ns, std::memory_order_relaxed);
+    low_address_map_stats.fixed_search_attempts.fetch_add(allocation.fixed_search_attempts, std::memory_order_relaxed);
+
+    switch (allocation.method) {
+        case ShadowAllocationMethod::MAP_32BIT:
+            low_address_map_stats.map32bit_allocations.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case ShadowAllocationMethod::FIXED_SEARCH:
+            low_address_map_stats.fixed_search_allocations.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case ShadowAllocationMethod::NONE:
+        default:
+            break;
+    }
+
+    if (replaced_shadow_size == 0) {
+        const uint64_t current_maps =
+            low_address_map_stats.active_shadow_maps.fetch_add(1, std::memory_order_relaxed) + 1;
+        update_peak_stat(low_address_map_stats.peak_shadow_maps, current_maps);
+    }
+
+    if (new_shadow_size > replaced_shadow_size) {
+        const uint64_t delta = static_cast<uint64_t>(new_shadow_size - replaced_shadow_size);
+        const uint64_t current_bytes =
+            low_address_map_stats.active_shadow_bytes.fetch_add(delta, std::memory_order_relaxed) + delta;
+        update_peak_stat(low_address_map_stats.peak_shadow_bytes, current_bytes);
+    } else if (replaced_shadow_size > new_shadow_size) {
+        low_address_map_stats.active_shadow_bytes.fetch_sub(
+            static_cast<uint64_t>(replaced_shadow_size - new_shadow_size),
+            std::memory_order_relaxed);
+    }
+}
+
+static void record_shadow_mapping_removed(size_t shadow_size)
+{
+    if (!should_collect_low_address_map_stats() || shadow_size == 0) {
+        return;
+    }
+
+    low_address_map_stats.active_shadow_maps.fetch_sub(1, std::memory_order_relaxed);
+    low_address_map_stats.active_shadow_bytes.fetch_sub(
+        static_cast<uint64_t>(shadow_size), std::memory_order_relaxed);
+}
+
+static LowAddressMapReportSnapshot capture_low_address_map_report_snapshot()
+{
+    LowAddressMapReportSnapshot snapshot{};
+    snapshot.successful_maps =
+        low_address_map_stats.successful_maps.load(std::memory_order_relaxed);
+    snapshot.compatible_maps =
+        low_address_map_stats.compatible_maps.load(std::memory_order_relaxed);
+    snapshot.high_pointer_maps =
+        low_address_map_stats.high_pointer_maps.load(std::memory_order_relaxed);
+    snapshot.shadow_maps =
+        low_address_map_stats.shadow_maps.load(std::memory_order_relaxed);
+    snapshot.disabled_high_pointer_maps =
+        low_address_map_stats.disabled_high_pointer_maps.load(std::memory_order_relaxed);
+    snapshot.allocation_failures =
+        low_address_map_stats.allocation_failures.load(std::memory_order_relaxed);
+    snapshot.active_shadow_maps =
+        low_address_map_stats.active_shadow_maps.load(std::memory_order_relaxed);
+    snapshot.active_shadow_bytes =
+        low_address_map_stats.active_shadow_bytes.load(std::memory_order_relaxed);
+
+    const uint64_t initial_copy_bytes =
+        low_address_map_stats.initial_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t flush_copy_bytes =
+        low_address_map_stats.flush_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t invalidate_copy_bytes =
+        low_address_map_stats.invalidate_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t submit_copy_bytes =
+        low_address_map_stats.submit_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t unmap_copy_bytes =
+        low_address_map_stats.unmap_copy_bytes.load(std::memory_order_relaxed);
+    snapshot.total_copy_bytes =
+        initial_copy_bytes + flush_copy_bytes + invalidate_copy_bytes + submit_copy_bytes +
+        unmap_copy_bytes;
+
+    return snapshot;
+}
+
+static bool low_address_map_report_changed(const LowAddressMapReportSnapshot& previous,
+                                           const LowAddressMapReportSnapshot& current)
+{
+    return previous.successful_maps != current.successful_maps ||
+           previous.compatible_maps != current.compatible_maps ||
+           previous.high_pointer_maps != current.high_pointer_maps ||
+           previous.shadow_maps != current.shadow_maps ||
+           previous.disabled_high_pointer_maps != current.disabled_high_pointer_maps ||
+           previous.allocation_failures != current.allocation_failures ||
+           previous.active_shadow_maps != current.active_shadow_maps ||
+           previous.active_shadow_bytes != current.active_shadow_bytes ||
+           previous.total_copy_bytes != current.total_copy_bytes;
+}
+
+static void maybe_log_low_address_map_progress(const char* reason, bool force)
+{
+    if (!should_collect_low_address_map_stats()) {
+        return;
+    }
+
+    const LowAddressMapReportSnapshot snapshot = capture_low_address_map_report_snapshot();
+    const auto now = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(low_address_map_report_mutex);
+        const bool has_changes =
+            !low_address_map_report_initialized ||
+            low_address_map_report_changed(low_address_map_last_report_snapshot, snapshot);
+        if (!force) {
+            if (!has_changes) {
+                return;
+            }
+
+            if (low_address_map_report_initialized &&
+                now - low_address_map_last_report_time < std::chrono::seconds(5)) {
+                return;
+            }
+        }
+
+        low_address_map_last_report_snapshot = snapshot;
+        low_address_map_last_report_time = now;
+        low_address_map_report_initialized = true;
+    }
+
+    std::string tag = "Low-address map progress";
+    if (reason != nullptr && reason[0] != '\0') {
+        tag += "[";
+        tag += reason;
+        tag += "]";
+    }
+
+    LOW_ADDRESS_LOG_INFO(tag +
+                         ": successful_maps=" + std::to_string(snapshot.successful_maps) +
+                         ", already_32bit=" + std::to_string(snapshot.compatible_maps) +
+                         ", high_pointer_maps=" + std::to_string(snapshot.high_pointer_maps) +
+                         ", shadow_maps=" + std::to_string(snapshot.shadow_maps) +
+                         ", disabled_high_pointer_maps=" + std::to_string(snapshot.disabled_high_pointer_maps) +
+                         ", allocation_failures=" + std::to_string(snapshot.allocation_failures) +
+                         ", active_shadows=" + std::to_string(snapshot.active_shadow_maps) +
+                         ", active_shadow_bytes=" + format_bytes(snapshot.active_shadow_bytes) +
+                         ", total_copy=" + format_bytes(snapshot.total_copy_bytes));
+}
+
+static void log_low_address_map_summary()
+{
+    if (!should_collect_low_address_map_stats()) {
+        return;
+    }
+
+    const uint64_t successful_maps =
+        low_address_map_stats.successful_maps.load(std::memory_order_relaxed);
+    const uint64_t compatible_maps =
+        low_address_map_stats.compatible_maps.load(std::memory_order_relaxed);
+    const uint64_t high_pointer_maps =
+        low_address_map_stats.high_pointer_maps.load(std::memory_order_relaxed);
+    const uint64_t shadow_maps =
+        low_address_map_stats.shadow_maps.load(std::memory_order_relaxed);
+    const uint64_t disabled_high_pointer_maps =
+        low_address_map_stats.disabled_high_pointer_maps.load(std::memory_order_relaxed);
+    const uint64_t resolve_failures =
+        low_address_map_stats.resolve_failures.load(std::memory_order_relaxed);
+    const uint64_t unsupported_size_failures =
+        low_address_map_stats.unsupported_size_failures.load(std::memory_order_relaxed);
+    const uint64_t allocation_failures =
+        low_address_map_stats.allocation_failures.load(std::memory_order_relaxed);
+    const uint64_t map32bit_allocations =
+        low_address_map_stats.map32bit_allocations.load(std::memory_order_relaxed);
+    const uint64_t fixed_search_allocations =
+        low_address_map_stats.fixed_search_allocations.load(std::memory_order_relaxed);
+    const uint64_t fixed_search_attempts =
+        low_address_map_stats.fixed_search_attempts.load(std::memory_order_relaxed);
+    const uint64_t total_shadow_bytes_reserved =
+        low_address_map_stats.total_shadow_bytes_reserved.load(std::memory_order_relaxed);
+    const uint64_t peak_shadow_maps =
+        low_address_map_stats.peak_shadow_maps.load(std::memory_order_relaxed);
+    const uint64_t peak_shadow_bytes =
+        low_address_map_stats.peak_shadow_bytes.load(std::memory_order_relaxed);
+    const uint64_t initial_copy_bytes =
+        low_address_map_stats.initial_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t flush_copy_bytes =
+        low_address_map_stats.flush_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t invalidate_copy_bytes =
+        low_address_map_stats.invalidate_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t submit_copy_bytes =
+        low_address_map_stats.submit_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t unmap_copy_bytes =
+        low_address_map_stats.unmap_copy_bytes.load(std::memory_order_relaxed);
+    const uint64_t allocation_time_ns =
+        low_address_map_stats.allocation_time_ns.load(std::memory_order_relaxed);
+    const uint64_t copy_time_ns =
+        low_address_map_stats.copy_time_ns.load(std::memory_order_relaxed);
+    const uint64_t total_copy_bytes =
+        initial_copy_bytes + flush_copy_bytes + invalidate_copy_bytes + submit_copy_bytes +
+        unmap_copy_bytes;
+
+    LOW_ADDRESS_LOG_INFO("Low-address map summary: workaround=" +
+                         std::string(should_use_low_address_shadow_map() ? "enabled" : "disabled") +
+                         ", debug=" + std::to_string(get_low_address_map_debug_level()) +
+                         ", successful_maps=" + std::to_string(successful_maps) +
+                         ", already_32bit=" + std::to_string(compatible_maps) +
+                         ", high_pointer_maps=" + std::to_string(high_pointer_maps) +
+                         ", shadow_maps=" + std::to_string(shadow_maps) +
+                         ", disabled_high_pointer_maps=" + std::to_string(disabled_high_pointer_maps) +
+                         ", resolve_failures=" + std::to_string(resolve_failures) +
+                         ", unsupported_size_failures=" + std::to_string(unsupported_size_failures) +
+                         ", allocation_failures=" + std::to_string(allocation_failures));
+
+    LOW_ADDRESS_LOG_INFO("Low-address map allocation stats: map32bit=" + std::to_string(map32bit_allocations) +
+                         ", fixed_search=" + std::to_string(fixed_search_allocations) +
+                         ", fixed_search_attempts=" + std::to_string(fixed_search_attempts) +
+                         ", total_shadow_reserved=" + format_bytes(total_shadow_bytes_reserved) +
+                         ", peak_active_shadows=" + std::to_string(peak_shadow_maps) +
+                         ", peak_shadow_bytes=" + format_bytes(peak_shadow_bytes) +
+                         ", allocation_time=" + format_duration_ms(allocation_time_ns));
+
+    LOW_ADDRESS_LOG_INFO("Low-address map copy stats: initial=" + format_bytes(initial_copy_bytes) +
+                         ", flush=" + format_bytes(flush_copy_bytes) +
+                         ", invalidate=" + format_bytes(invalidate_copy_bytes) +
+                         ", submit=" + format_bytes(submit_copy_bytes) +
+                         ", unmap=" + format_bytes(unmap_copy_bytes) +
+                         ", total=" + format_bytes(total_copy_bytes) +
+                         ", copy_time=" + format_duration_ms(copy_time_ns));
 }
 
 struct DxvkFeatureSpoofConfig {
@@ -361,10 +839,11 @@ static bool compute_copy_region(const ShadowMappingInfo& mapping, VkDeviceSize r
     return true;
 }
 
-static void* allocate_low_address_shadow(size_t requested_size, size_t* out_shadow_size)
+static ShadowAllocationResult allocate_low_address_shadow(size_t requested_size)
 {
-    if (out_shadow_size == nullptr || requested_size == 0) {
-        return nullptr;
+    ShadowAllocationResult result{};
+    if (requested_size == 0) {
+        return result;
     }
 
     long page_size_value = sysconf(_SC_PAGESIZE);
@@ -375,8 +854,18 @@ static void* allocate_low_address_shadow(size_t requested_size, size_t* out_shad
     const size_t page_size = static_cast<size_t>(page_size_value);
     const size_t aligned_size = ((requested_size + page_size - 1) / page_size) * page_size;
     if (aligned_size == 0 || aligned_size < requested_size) {
-        return nullptr;
+        return result;
     }
+
+    if (should_trace_low_address_map_events()) {
+        LOW_ADDRESS_LOG_DEBUG("Low-address allocation request: requested=" +
+                              format_bytes(static_cast<uint64_t>(requested_size)) +
+                              ", aligned=" + format_bytes(static_cast<uint64_t>(aligned_size)));
+    }
+
+    const bool collect_stats = should_collect_low_address_map_stats();
+    const auto start_time = collect_stats ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
 
 #ifdef MAP_32BIT
     void* mapped = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
@@ -385,10 +874,24 @@ static void* allocate_low_address_shadow(size_t requested_size, size_t* out_shad
         const uint64_t mapped_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mapped));
         const uint64_t mapped_end = mapped_addr + static_cast<uint64_t>(aligned_size);
         if (mapped_end <= kMax32BitAddressExclusive) {
-            *out_shadow_size = aligned_size;
-            return mapped;
+            result.ptr = mapped;
+            result.size = aligned_size;
+            result.method = ShadowAllocationMethod::MAP_32BIT;
+            if (collect_stats) {
+                result.elapsed_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start_time).count());
+            }
+            return result;
+        }
+        if (should_trace_low_address_map_events()) {
+            LOW_ADDRESS_LOG_DEBUG("Low-address MAP_32BIT candidate discarded: ptr=" +
+                                  format_pointer(mapped) +
+                                  ", size=" + format_bytes(static_cast<uint64_t>(aligned_size)));
         }
         munmap(mapped, aligned_size);
+    } else {
+        result.last_errno = errno;
     }
 #endif
 
@@ -396,19 +899,34 @@ static void* allocate_low_address_shadow(size_t requested_size, size_t* out_shad
          addr < kShadowSearchEnd &&
              static_cast<uint64_t>(addr) + static_cast<uint64_t>(aligned_size) < kMax32BitAddressExclusive;
          addr += kShadowSearchStep) {
+        result.fixed_search_attempts++;
         void* mapped = mmap(reinterpret_cast<void*>(addr), aligned_size, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (mapped != MAP_FAILED) {
-            *out_shadow_size = aligned_size;
-            return mapped;
+            result.ptr = mapped;
+            result.size = aligned_size;
+            result.method = ShadowAllocationMethod::FIXED_SEARCH;
+            if (collect_stats) {
+                result.elapsed_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start_time).count());
+            }
+            return result;
         }
 
-        if (errno != EEXIST && errno != EINVAL && errno != ENOMEM && errno != EBUSY) {
+        result.last_errno = errno;
+        if (result.last_errno != EEXIST && result.last_errno != EINVAL &&
+            result.last_errno != ENOMEM && result.last_errno != EBUSY) {
             break;
         }
     }
 
-    return nullptr;
+    if (collect_stats) {
+        result.elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start_time).count());
+    }
+    return result;
 }
 
 static void remove_tracking_for_device(VkDevice device)
@@ -435,10 +953,19 @@ static void remove_tracking_for_device(VkDevice device)
         }
     }
 
+    uint64_t released_shadow_bytes = 0;
     for (const auto& mapping : stale_mappings) {
         if (mapping.shadow_ptr != nullptr && mapping.shadow_size > 0) {
+            released_shadow_bytes += static_cast<uint64_t>(mapping.shadow_size);
+            record_shadow_mapping_removed(mapping.shadow_size);
             munmap(mapping.shadow_ptr, mapping.shadow_size);
         }
+    }
+
+    if (!stale_mappings.empty()) {
+        LOW_ADDRESS_LOG_INFO("Low-address device cleanup: device=" + format_pointer(device) +
+                             ", stale_mappings=" + std::to_string(stale_mappings.size()) +
+                             ", released=" + format_bytes(released_shadow_bytes));
     }
 }
 
@@ -818,6 +1345,14 @@ bool InitializeWrapper() {
         Logger::Instance().SetLevel(LogLevel::DEBUG);
     }
 
+    if (should_collect_low_address_map_stats()) {
+        LOW_ADDRESS_LOG_INFO("Low-address map debug enabled: level=" +
+                             std::to_string(get_low_address_map_debug_level()) +
+                             ", workaround=" +
+                             std::string(should_use_low_address_shadow_map() ? "enabled" : "disabled") +
+                             ". A summary will be emitted when the wrapper unloads.");
+    }
+
     if (should_install_crash_handler()) {
         struct sigaction sa{};
         sa.sa_sigaction = crash_signal_handler;
@@ -842,6 +1377,7 @@ bool InitializeWrapper() {
 }
 
 void ShutdownWrapper() {
+    log_low_address_map_summary();
     LOG_INFO("Shutting down Mali Wrapper ICD");
     GetWSIManager().cleanup();
     LibraryLoader::Instance().UnloadLibraries();
@@ -1457,16 +1993,44 @@ static void maybe_apply_shadow_mapping(VkDevice device, VkDeviceMemory memory,
         return;
     }
 
+    if (should_collect_low_address_map_stats()) {
+        low_address_map_stats.successful_maps.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (is_pointer_32bit_compatible(*ppData)) {
+        if (should_collect_low_address_map_stats()) {
+            low_address_map_stats.compatible_maps.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (should_trace_low_address_map_events()) {
+            LOW_ADDRESS_LOG_DEBUG("Low-address map bypassed: pointer already 32-bit-compatible, ptr=" +
+                                  format_pointer(*ppData) +
+                                  ", offset=" + std::to_string(offset) +
+                                  ", size=" + std::to_string(size));
+        }
+        maybe_log_low_address_map_progress("already-32bit", false);
         return;
     }
 
+    if (should_collect_low_address_map_stats()) {
+        low_address_map_stats.high_pointer_maps.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (should_trace_low_address_map_events()) {
+        LOW_ADDRESS_LOG_DEBUG("Low-address high pointer detected: real=" + format_pointer(*ppData) +
+                              ", offset=" + std::to_string(offset) +
+                              ", size=" + std::to_string(size));
+    }
+
     if (!should_use_low_address_shadow_map()) {
+        if (should_collect_low_address_map_stats()) {
+            low_address_map_stats.disabled_high_pointer_maps.fetch_add(1, std::memory_order_relaxed);
+        }
         static std::once_flag warning_once;
         std::call_once(warning_once, []() {
-            LOG_WARN("Detected >32-bit mapped pointer while low-address workaround is disabled. "
-                     "Set MALI_WRAPPER_LOW_ADDRESS_MAP=1 to force compatibility mode.");
+            LOW_ADDRESS_LOG_WARN("Detected >32-bit mapped pointer while low-address workaround is disabled. "
+                                 "Set MALI_WRAPPER_LOW_ADDRESS_MAP=1 to force compatibility mode.");
         });
+        maybe_log_low_address_map_progress("disabled-high-pointer", true);
         return;
     }
 
@@ -1476,24 +2040,47 @@ static void maybe_apply_shadow_mapping(VkDevice device, VkDeviceMemory memory,
     {
         std::lock_guard<std::mutex> lock(memory_tracking_mutex);
         if (!resolve_map_size_locked(key, offset, size, &resolved_size)) {
-            LOG_WARN("Low-address map workaround skipped: unable to resolve mapping size");
+            if (should_collect_low_address_map_stats()) {
+                low_address_map_stats.resolve_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            LOW_ADDRESS_LOG_WARN("Low-address map workaround skipped: unable to resolve mapping size");
+            maybe_log_low_address_map_progress("resolve-failed", true);
             return;
         }
     }
 
     if (resolved_size == 0 || resolved_size > static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max())) {
-        LOG_WARN("Low-address map workaround skipped: mapping size is unsupported");
+        if (should_collect_low_address_map_stats()) {
+            low_address_map_stats.unsupported_size_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        LOW_ADDRESS_LOG_WARN("Low-address map workaround skipped: mapping size is unsupported");
+        maybe_log_low_address_map_progress("size-unsupported", true);
         return;
     }
 
-    size_t shadow_size = 0;
-    void* shadow_ptr = allocate_low_address_shadow(static_cast<size_t>(resolved_size), &shadow_size);
-    if (shadow_ptr == nullptr) {
-        LOG_WARN("Low-address map workaround failed: unable to allocate shadow mapping");
+    const void* real_ptr = *ppData;
+    const ShadowAllocationResult allocation =
+        allocate_low_address_shadow(static_cast<size_t>(resolved_size));
+    if (allocation.ptr == nullptr) {
+        if (should_collect_low_address_map_stats()) {
+            low_address_map_stats.allocation_failures.fetch_add(1, std::memory_order_relaxed);
+            low_address_map_stats.allocation_time_ns.fetch_add(allocation.elapsed_ns, std::memory_order_relaxed);
+            low_address_map_stats.fixed_search_attempts.fetch_add(
+                allocation.fixed_search_attempts, std::memory_order_relaxed);
+        }
+        LOW_ADDRESS_LOG_WARN("Low-address map workaround failed: unable to allocate shadow mapping");
+        if (should_trace_low_address_map_events()) {
+            LOW_ADDRESS_LOG_INFO("Low-address shadow map allocation failure: real=" + format_pointer(real_ptr) +
+                                 ", size=" + format_bytes(static_cast<uint64_t>(resolved_size)) +
+                                 ", last_errno=" + std::to_string(allocation.last_errno) +
+                                 ", fixed_search_attempts=" + std::to_string(allocation.fixed_search_attempts));
+        }
+        maybe_log_low_address_map_progress("alloc-failed", true);
         return;
     }
 
-    std::memcpy(shadow_ptr, *ppData, static_cast<size_t>(resolved_size));
+    tracked_memcpy(allocation.ptr, real_ptr, static_cast<size_t>(resolved_size),
+                   LowAddressCopyKind::MAP_TO_SHADOW);
 
     ShadowMappingInfo stale_mapping{};
     bool has_stale_mapping = false;
@@ -1503,17 +2090,41 @@ static void maybe_apply_shadow_mapping(VkDevice device, VkDeviceMemory memory,
         if (it != shadow_mappings.end()) {
             stale_mapping = it->second;
             has_stale_mapping = true;
-            it->second = ShadowMappingInfo{ *ppData, shadow_ptr, shadow_size, offset, resolved_size };
+            it->second = ShadowMappingInfo{ const_cast<void*>(real_ptr), allocation.ptr,
+                                            allocation.size, offset, resolved_size };
         } else {
-            shadow_mappings.emplace(key, ShadowMappingInfo{ *ppData, shadow_ptr, shadow_size, offset, resolved_size });
+            shadow_mappings.emplace(key, ShadowMappingInfo{ const_cast<void*>(real_ptr), allocation.ptr,
+                                                            allocation.size, offset, resolved_size });
         }
     }
 
+    record_shadow_mapping_installed(allocation.size,
+                                    has_stale_mapping ? stale_mapping.shadow_size : 0,
+                                    allocation);
+
     if (has_stale_mapping && stale_mapping.shadow_ptr != nullptr && stale_mapping.shadow_size > 0) {
+        if (should_trace_low_address_map_events()) {
+            LOW_ADDRESS_LOG_DEBUG("Low-address shadow map replaced: old_shadow=" +
+                                  format_pointer(stale_mapping.shadow_ptr) +
+                                  ", old_size=" + format_bytes(static_cast<uint64_t>(stale_mapping.shadow_size)));
+        }
+        record_shadow_mapping_removed(stale_mapping.shadow_size);
         munmap(stale_mapping.shadow_ptr, stale_mapping.shadow_size);
     }
 
-    *ppData = shadow_ptr;
+    if (should_trace_low_address_map_events()) {
+        LOW_ADDRESS_LOG_INFO("Low-address shadow map applied: real=" + format_pointer(real_ptr) +
+                             ", shadow=" + format_pointer(allocation.ptr) +
+                             ", size=" + format_bytes(static_cast<uint64_t>(resolved_size)) +
+                             ", offset=" + std::to_string(offset) +
+                             ", method=" + shadow_allocation_method_to_string(allocation.method) +
+                             ", fixed_search_attempts=" + std::to_string(allocation.fixed_search_attempts) +
+                             ", allocation_time=" + format_duration_ms(allocation.elapsed_ns));
+    }
+
+    maybe_log_low_address_map_progress("shadow-applied", true);
+
+    *ppData = allocation.ptr;
 }
 
 static void sync_shadow_to_real(VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange* pMemoryRanges)
@@ -1524,6 +2135,7 @@ static void sync_shadow_to_real(VkDevice device, uint32_t memoryRangeCount, cons
         return;
     }
 
+    bool copied_anything = false;
     std::lock_guard<std::mutex> lock(memory_tracking_mutex);
     for (uint32_t i = 0; i < memoryRangeCount; i++) {
         const VkMappedMemoryRange& range = pMemoryRanges[i];
@@ -1541,7 +2153,13 @@ static void sync_shadow_to_real(VkDevice device, uint32_t memoryRangeCount, cons
 
         auto* shadow_bytes = static_cast<const uint8_t*>(map_it->second.shadow_ptr);
         auto* real_bytes = static_cast<uint8_t*>(map_it->second.real_ptr);
-        std::memcpy(real_bytes + byte_offset, shadow_bytes + byte_offset, byte_count);
+        tracked_memcpy(real_bytes + byte_offset, shadow_bytes + byte_offset, byte_count,
+                       LowAddressCopyKind::FLUSH_TO_REAL);
+        copied_anything = true;
+    }
+
+    if (copied_anything) {
+        maybe_log_low_address_map_progress("flush", false);
     }
 }
 
@@ -1553,6 +2171,7 @@ static void sync_real_to_shadow(VkDevice device, uint32_t memoryRangeCount, cons
         return;
     }
 
+    bool copied_anything = false;
     std::lock_guard<std::mutex> lock(memory_tracking_mutex);
     for (uint32_t i = 0; i < memoryRangeCount; i++) {
         const VkMappedMemoryRange& range = pMemoryRanges[i];
@@ -1570,7 +2189,13 @@ static void sync_real_to_shadow(VkDevice device, uint32_t memoryRangeCount, cons
 
         auto* shadow_bytes = static_cast<uint8_t*>(map_it->second.shadow_ptr);
         auto* real_bytes = static_cast<const uint8_t*>(map_it->second.real_ptr);
-        std::memcpy(shadow_bytes + byte_offset, real_bytes + byte_offset, byte_count);
+        tracked_memcpy(shadow_bytes + byte_offset, real_bytes + byte_offset, byte_count,
+                       LowAddressCopyKind::INVALIDATE_TO_SHADOW);
+        copied_anything = true;
+    }
+
+    if (copied_anything) {
+        maybe_log_low_address_map_progress("invalidate", false);
     }
 }
 
@@ -1582,6 +2207,7 @@ static void sync_all_shadows_for_device(VkDevice device)
         return;
     }
 
+    bool copied_anything = false;
     std::lock_guard<std::mutex> lock(memory_tracking_mutex);
     for (auto& entry : shadow_mappings) {
         if (entry.first.device != device) {
@@ -1595,7 +2221,13 @@ static void sync_all_shadows_for_device(VkDevice device)
             continue;
         }
 
-        std::memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size));
+        tracked_memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size),
+                       LowAddressCopyKind::SUBMIT_TO_REAL);
+        copied_anything = true;
+    }
+
+    if (copied_anything) {
+        maybe_log_low_address_map_progress("queue-submit", false);
     }
 }
 
@@ -1603,6 +2235,7 @@ static void sync_all_shadows()
 {
     using namespace mali_wrapper;
 
+    bool copied_anything = false;
     std::lock_guard<std::mutex> lock(memory_tracking_mutex);
     for (auto& entry : shadow_mappings) {
         auto& mapping = entry.second;
@@ -1612,7 +2245,13 @@ static void sync_all_shadows()
             continue;
         }
 
-        std::memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size));
+        tracked_memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size),
+                       LowAddressCopyKind::SUBMIT_TO_REAL);
+        copied_anything = true;
+    }
+
+    if (copied_anything) {
+        maybe_log_low_address_map_progress("queue-submit", false);
     }
 }
 
@@ -1676,6 +2315,11 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkFreeMemory(
     }
 
     if (has_stale_mapping && stale_mapping.shadow_ptr != nullptr && stale_mapping.shadow_size > 0) {
+        LOW_ADDRESS_LOG_INFO("Low-address free cleanup: memory=" +
+                             format_device_memory_handle(memory) +
+                             ", shadow=" + format_pointer(stale_mapping.shadow_ptr) +
+                             ", size=" + format_bytes(static_cast<uint64_t>(stale_mapping.shadow_size)));
+        record_shadow_mapping_removed(stale_mapping.shadow_size);
         munmap(stale_mapping.shadow_ptr, stale_mapping.shadow_size);
     }
 
@@ -1728,14 +2372,24 @@ static bool pop_shadow_mapping(VkDevice device, VkDeviceMemory memory, mali_wrap
 
 static void finalize_shadow_mapping(mali_wrapper::ShadowMappingInfo& mapping)
 {
+    using namespace mali_wrapper;
+
     if (mapping.real_ptr != nullptr && mapping.shadow_ptr != nullptr &&
         mapping.mapped_size > 0 &&
         mapping.mapped_size <= static_cast<VkDeviceSize>(std::numeric_limits<size_t>::max())) {
-        std::memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size));
+        tracked_memcpy(mapping.real_ptr, mapping.shadow_ptr, static_cast<size_t>(mapping.mapped_size),
+                       LowAddressCopyKind::UNMAP_TO_REAL);
     }
 
     if (mapping.shadow_ptr != nullptr && mapping.shadow_size > 0) {
+        if (should_trace_low_address_map_events()) {
+            LOW_ADDRESS_LOG_INFO("Low-address shadow map finalized: real=" + format_pointer(mapping.real_ptr) +
+                                 ", shadow=" + format_pointer(mapping.shadow_ptr) +
+                                 ", size=" + format_bytes(static_cast<uint64_t>(mapping.mapped_size)));
+        }
+        record_shadow_mapping_removed(mapping.shadow_size);
         munmap(mapping.shadow_ptr, mapping.shadow_size);
+        maybe_log_low_address_map_progress("unmap", true);
     }
 }
 

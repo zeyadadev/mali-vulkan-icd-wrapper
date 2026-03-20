@@ -5,8 +5,57 @@
 #include <sstream>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 
 namespace mali_wrapper {
+
+namespace {
+
+static uint32_t category_mask(LogCategory category)
+{
+    return static_cast<uint32_t>(category);
+}
+
+static std::string normalize_category_token(const std::string& token)
+{
+    std::string normalized;
+    normalized.reserve(token.size());
+    for (char ch : token) {
+        if (!std::isspace(static_cast<unsigned char>(ch))) {
+            normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+    }
+    return normalized;
+}
+
+static bool append_category_token(const std::string& token, uint32_t* mask)
+{
+    if (mask == nullptr || token.empty()) {
+        return false;
+    }
+
+    if (token == "wrapper") {
+        *mask |= category_mask(LogCategory::WRAPPER);
+        return true;
+    }
+
+    if (token == "wsi") {
+        *mask |= category_mask(LogCategory::WSI_LAYER);
+        return true;
+    }
+
+    if (token == "low-address-map" || token == "low_address_map" ||
+        token == "low-address" || token == "low_address" ||
+        token == "lowaddr" || token == "lowaddressmap") {
+        *mask |= category_mask(LogCategory::LOW_ADDRESS_MAP);
+        return true;
+    }
+
+    return false;
+}
+
+} // namespace
 
 Logger::Logger() {
     InitFromEnv();
@@ -49,25 +98,35 @@ void Logger::Log(LogLevel level, LogCategory category, const std::string& messag
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()) % 1000;
 
-    std::stringstream ss;
-    ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
-    ss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+    std::stringstream prefix;
+    prefix << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+    prefix << '.' << std::setfill('0') << std::setw(3) << ms.count();
 
+    std::stringstream console_ss;
+    console_ss << prefix.str();
     if (console_enabled_ && colors_enabled_) {
-        ss << " [" << GetColorCode(level) << LevelToString(level) << GetResetCode() << "]["
-           << GetCategoryColor(category) << CategoryToString(category) << GetResetCode() << "] " << message;
+        console_ss << " [" << GetColorCode(level) << LevelToString(level) << GetResetCode() << "]["
+                   << GetCategoryColor(category) << CategoryToString(category) << GetResetCode() << "] "
+                   << message;
     } else {
-        ss << " [" << LevelToString(level) << "][" << CategoryToString(category) << "] " << message;
+        console_ss << " [" << LevelToString(level) << "][" << CategoryToString(category) << "] "
+                   << message;
     }
 
-    std::string log_line = ss.str();
+    std::stringstream file_ss;
+    file_ss << prefix.str()
+            << " [" << LevelToString(level) << "][" << CategoryToString(category) << "] "
+            << message;
+
+    const std::string console_line = console_ss.str();
+    const std::string file_line = file_ss.str();
 
     if (console_enabled_) {
-        std::cout << log_line << std::endl;
+        std::cout << console_line << std::endl;
     }
 
     if (file_stream_ && file_stream_->is_open()) {
-        *file_stream_ << log_line << std::endl;
+        *file_stream_ << file_line << std::endl;
         file_stream_->flush();
     }
 }
@@ -120,6 +179,22 @@ void Logger::WsiDebug(const std::string& message) {
     Log(LogLevel::DEBUG, LogCategory::WSI_LAYER, message);
 }
 
+void Logger::LowAddressError(const std::string& message) {
+    Log(LogLevel::ERROR, LogCategory::LOW_ADDRESS_MAP, message);
+}
+
+void Logger::LowAddressWarn(const std::string& message) {
+    Log(LogLevel::WARN, LogCategory::LOW_ADDRESS_MAP, message);
+}
+
+void Logger::LowAddressInfo(const std::string& message) {
+    Log(LogLevel::INFO, LogCategory::LOW_ADDRESS_MAP, message);
+}
+
+void Logger::LowAddressDebug(const std::string& message) {
+    Log(LogLevel::DEBUG, LogCategory::LOW_ADDRESS_MAP, message);
+}
+
 void Logger::WsiLogF(LogLevel level, const char* format, ...) {
     if (!ShouldLog(level, LogCategory::WSI_LAYER)) {
         return;
@@ -136,6 +211,22 @@ void Logger::WsiLogF(LogLevel level, const char* format, ...) {
     Log(level, LogCategory::WSI_LAYER, std::string(buffer));
 }
 
+void Logger::LowAddressLogF(LogLevel level, const char* format, ...) {
+    if (!ShouldLog(level, LogCategory::LOW_ADDRESS_MAP)) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, format);
+
+    char buffer[1024];
+    vsnprintf(buffer, sizeof(buffer), format, args);
+
+    va_end(args);
+
+    Log(level, LogCategory::LOW_ADDRESS_MAP, std::string(buffer));
+}
+
 void Logger::InitFromEnv() {
     const char* log_level = std::getenv("MALI_WRAPPER_LOG_LEVEL");
     if (log_level) {
@@ -147,7 +238,7 @@ void Logger::InitFromEnv() {
 
     const char* log_category = std::getenv("MALI_WRAPPER_LOG_CATEGORY");
     if (log_category) {
-        LogCategory parsed_category = ParseCategory(log_category);
+        const LogCategory parsed_category = ParseCategory(log_category);
         if (parsed_category == LogCategory::NONE) {
             LogCategoryWarning(log_category);
             category_ = LogCategory::NONE; // Disable logging for invalid category
@@ -177,18 +268,7 @@ bool Logger::ShouldLog(LogLevel level, LogCategory category) const {
         return false;
     }
 
-    switch (category_) {
-        case LogCategory::WRAPPER:
-            return category == LogCategory::WRAPPER;
-        case LogCategory::WSI_LAYER:
-            return category == LogCategory::WSI_LAYER;
-        case LogCategory::WRAPPER_WSI:
-            return category == LogCategory::WRAPPER || category == LogCategory::WSI_LAYER;
-        case LogCategory::NONE:
-            return false;
-        default:
-            return true;
-    }
+    return (category_mask(category_) & category_mask(category)) != 0;
 }
 
 const char* Logger::LevelToString(LogLevel level) {
@@ -202,17 +282,50 @@ const char* Logger::LevelToString(LogLevel level) {
 }
 
 LogCategory Logger::ParseCategory(const char* category_str) {
-    if (!category_str) return LogCategory::WRAPPER_WSI;
-
-    if (std::strcmp(category_str, "wrapper") == 0) {
-        return LogCategory::WRAPPER;
-    } else if (std::strcmp(category_str, "wsi") == 0) {
-        return LogCategory::WSI_LAYER;
-    } else if (std::strcmp(category_str, "wrapper+wsi") == 0 || std::strcmp(category_str, "wsi+wrapper") == 0) {
-        return LogCategory::WRAPPER_WSI;
-    } else {
-        return LogCategory::NONE; // Invalid category
+    if (!category_str) {
+        return LogCategory::ALL;
     }
+
+    std::string value(category_str);
+    if (value.empty()) {
+        return LogCategory::ALL;
+    }
+
+    uint32_t mask = 0;
+    std::string token;
+    bool saw_token = false;
+
+    auto flush_token = [&]() -> bool {
+        const std::string normalized = normalize_category_token(token);
+        token.clear();
+        if (normalized.empty()) {
+            return false;
+        }
+
+        saw_token = true;
+        return append_category_token(normalized, &mask);
+    };
+
+    for (char ch : value) {
+        if (ch == '+' || ch == ',') {
+            if (!flush_token()) {
+                return LogCategory::NONE;
+            }
+            continue;
+        }
+
+        token.push_back(ch);
+    }
+
+    if (!token.empty() && !flush_token()) {
+        return LogCategory::NONE;
+    }
+
+    if (!saw_token || mask == 0) {
+        return LogCategory::NONE;
+    }
+
+    return static_cast<LogCategory>(mask);
 }
 
 std::string Logger::GetColorCode(LogLevel level) const {
@@ -237,24 +350,41 @@ std::string Logger::GetCategoryColor(LogCategory category) const {
     switch (category) {
         case LogCategory::WRAPPER: return "\033[1;32m"; // Bold Green
         case LogCategory::WSI_LAYER: return "\033[1;34m"; // Bold Blue
+        case LogCategory::LOW_ADDRESS_MAP: return "\033[1;35m"; // Bold Magenta
         case LogCategory::WRAPPER_WSI: return "\033[1;37m"; // Bold White
         case LogCategory::NONE: return "\033[1;31m"; // Bold Red
         default: return "";
     }
 }
 
-const char* Logger::CategoryToString(LogCategory category) {
-    switch (category) {
-        case LogCategory::WRAPPER: return "WRAPPER";
-        case LogCategory::WSI_LAYER: return "WSI";
-        case LogCategory::WRAPPER_WSI: return "WRAPPER+WSI";
-        case LogCategory::NONE: return "NONE";
-        default: return "UNKNOWN";
+std::string Logger::CategoryToString(LogCategory category) const {
+    if (category == LogCategory::NONE) {
+        return "NONE";
     }
+
+    std::string label;
+    auto append = [&](LogCategory bit, const char* name) {
+        if ((category_mask(category) & category_mask(bit)) == 0) {
+            return;
+        }
+
+        if (!label.empty()) {
+            label += '+';
+        }
+        label += name;
+    };
+
+    append(LogCategory::WRAPPER, "WRAPPER");
+    append(LogCategory::WSI_LAYER, "WSI");
+    append(LogCategory::LOW_ADDRESS_MAP, "LOW_ADDRESS_MAP");
+
+    return label.empty() ? "UNKNOWN" : label;
 }
 
 void Logger::LogCategoryWarning(const char* invalid_category) {
-    fprintf(stderr, "\033[1;31m[WARNING]\033[0m Unknown log category '%s'. Valid options: wrapper, wsi, wrapper+wsi, wsi+wrapper. Logging disabled.\n", invalid_category);
+    fprintf(stderr,
+            "\033[1;31m[WARNING]\033[0m Unknown log category '%s'. Valid options: wrapper, wsi, low-address-map, or combinations joined with '+'. Logging disabled.\n",
+            invalid_category);
 }
 
 } // namespace mali_wrapper

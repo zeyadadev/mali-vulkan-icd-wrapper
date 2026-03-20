@@ -197,7 +197,7 @@ The wrapper includes a configurable logging system. Set these environment variab
 # Log levels: 0=ERROR, 1=WARN, 2=INFO, 3=DEBUG
 export MALI_WRAPPER_LOG_LEVEL=2
 
-# Categories: wrapper, wsi, wrapper+wsi
+# Categories: wrapper, wsi, low-address-map, or combinations like wrapper+wsi+low-address-map
 export MALI_WRAPPER_LOG_CATEGORY=wrapper+wsi
 
 # Colors and console output
@@ -239,6 +239,8 @@ Notes:
 Additional compatibility toggles:
 - `MALI_WRAPPER_FILTER_EXTERNAL_MEMORY_HOST=1`: hide `VK_EXT_external_memory_host` from device extension enumeration and remove it from `vkCreateDevice` extension lists.
 - `MALI_WRAPPER_LOW_ADDRESS_MAP=1`: explicitly enable low-address shadow mappings for `vkMapMemory`/`vkMapMemory2` to keep pointers 32-bit compatible. If unset, the workaround stays disabled.
+- `MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG=1`: emit live progress lines during gameplay plus a shutdown summary showing how often the workaround was needed, how many bytes were copied, and how much time was spent in shadow allocation/copy work.
+- `MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG=2`: also log each shadow-map install/finalize event, each copy operation, and cleanup events. Best paired with `MALI_WRAPPER_LOG_LEVEL=3`, `MALI_WRAPPER_LOG_CATEGORY=low-address-map`, and `MALI_WRAPPER_LOG_FILE=/tmp/mali_wrapper.log`.
 
 ## How It Works
 
