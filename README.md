@@ -118,6 +118,49 @@ When `WRAPPER_INSTALL_SYSTEM=1` (default), the script automatically:
 
 If the script adds your user to a new dma_heap access group, log out and back in once for group membership to take effect.
 
+### Kernel Patch For Zero-Copy Low-Address Mapping
+
+This is only needed if you want the zero-copy `MALI_WRAPPER_LOW_ADDRESS_MAP=1` path for 32-bit guests on top of a 64-bit Mali userspace stack.
+
+Why this exists:
+
+- without a kernel patch, the wrapper can keep 32-bit `vkMapMemory` pointers compatible only by using a shadow mapping and copying data back to the real mapping
+- with the included kernel patch, the wrapper can ask kbase for a second low (`< 4 GiB`) CPU mapping of the same pages
+- that removes the submit-time shadow memcpy cost while keeping libmali's original high mapping intact
+
+Repository-specific details:
+
+- the included kernel patch targets the active `bifrost/` Mali driver tree used by `zeyadadev/linux-rockchip`
+- if the patched kernel is not installed, the wrapper automatically falls back to shadow mode
+
+Included files:
+
+- patch: `patches/kernel/0001-mali-add-bifrost-low32-alias-mapping-support.patch`
+- helper script: `scripts/kernel/build_patched_linux_rockchip.sh`
+
+Recommended scripted flow:
+
+```bash
+./scripts/kernel/build_patched_linux_rockchip.sh
+```
+
+By default, the script:
+
+- clones `https://github.com/zeyadadev/linux-rockchip.git`
+- checks out `rk-6.1-rkr6.1`
+- applies the included git-format patch with `git am`
+- seeds `.config` from the currently running kernel if available
+- builds Debian packages with `make bindeb-pkg`
+- can optionally install the generated packages and reboot
+
+Notes:
+
+- `bindeb-pkg` uses significantly more disk space than a plain `make Image dtbs modules` build
+- if `/home` is small, override `KERNEL_DIR` to a path on a larger filesystem
+- the script manages its own clone; resetting that clone is safe, but do not point it at a kernel worktree that contains unrelated local work you want to keep
+
+Manual kernel build is also supported. In that case, make sure you install the matching modules as well as the kernel image, because booting a new `Image` with old modules can break driver loading after reboot.
+
 ### Manual CMake
 
 Only needed for custom CI/packaging flows. The script above is the recommended path.
@@ -238,9 +281,9 @@ Notes:
 
 Additional compatibility toggles:
 - `MALI_WRAPPER_FILTER_EXTERNAL_MEMORY_HOST=1`: hide `VK_EXT_external_memory_host` from device extension enumeration and remove it from `vkCreateDevice` extension lists.
-- `MALI_WRAPPER_LOW_ADDRESS_MAP=1`: explicitly enable low-address shadow mappings for `vkMapMemory`/`vkMapMemory2` to keep pointers 32-bit compatible. If unset, the workaround stays disabled.
-- `MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG=1`: emit live progress lines during gameplay plus a shutdown summary showing how often the workaround was needed, how many bytes were copied, and how much time was spent in shadow allocation/copy work.
-- `MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG=2`: also log each shadow-map install/finalize event, each copy operation, and cleanup events. Best paired with `MALI_WRAPPER_LOG_LEVEL=3`, `MALI_WRAPPER_LOG_CATEGORY=low-address-map`, and `MALI_WRAPPER_LOG_FILE=/tmp/mali_wrapper.log`.
+- `MALI_WRAPPER_LOW_ADDRESS_MAP=1`: enable low-address mapping support for `vkMapMemory`/`vkMapMemory2` so returned pointers stay 32-bit compatible. With the patched bifrost kernel, the wrapper uses a zero-copy alias mapping first; otherwise it falls back to the older shadow-copy path.
+- `MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG=1`: emit live progress lines during gameplay plus a shutdown summary showing which path was used (`normal`, `alias`, or `shadow`) and how often fallback/copy work happened.
+- `MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG=2`: also log alias fd discovery, alias ioctl attempts, alias `mmap()` failures, shadow-map install/finalize events, copy operations, and cleanup events. Best paired with `MALI_WRAPPER_LOG_LEVEL=3`, `MALI_WRAPPER_LOG_CATEGORY=low-address-map`, and `MALI_WRAPPER_LOG_FILE=/tmp/mali_wrapper.log`.
 
 ## How It Works
 
