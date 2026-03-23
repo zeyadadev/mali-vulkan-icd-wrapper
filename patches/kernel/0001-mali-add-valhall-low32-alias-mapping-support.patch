@@ -1,0 +1,378 @@
+From 44e52d9b086e73e91f8cd7cedd46d8a7df5963eb Mon Sep 17 00:00:00 2001
+From: Ayman Zeyada <zeyada.ayman@gmail.com>
+Date: Mon, 23 Mar 2026 21:49:07 +0200
+Subject: [PATCH] mali: add valhall low32 alias mapping support
+
+---
+ .../gpu/arm/valhall/mali_kbase_core_linux.c   |  11 ++
+ .../arm/valhall/mali_kbase_ioctl_helpers.h    |   6 +
+ drivers/gpu/arm/valhall/mali_kbase_mem.c      |   6 +-
+ drivers/gpu/arm/valhall/mali_kbase_mem.h      |  20 ++
+ .../gpu/arm/valhall/mali_kbase_mem_linux.c    | 183 ++++++++++++++++++
+ .../gpu/arm/valhall/mali_kbase_mem_linux.h    |  12 ++
+ .../arm/valhall/thirdparty/mali_kbase_mmap.c  |   4 +-
+ .../uapi/gpu/arm/valhall/mali_kbase_ioctl.h   |  16 ++
+ 8 files changed, 254 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/arm/valhall/mali_kbase_core_linux.c b/drivers/gpu/arm/valhall/mali_kbase_core_linux.c
+index 649a64888e31..19c70864e927 100644
+--- a/drivers/gpu/arm/valhall/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/valhall/mali_kbase_core_linux.c
+@@ -1115,6 +1115,12 @@ static int kbase_api_mem_alias(struct kbase_context *kctx, union kbase_ioctl_mem
+ 	return err;
+ }
+ 
++static int kbase_api_mem_low32_alias_create(
++	struct kbase_context *kctx, struct kbase_ioctl_mem_low32_alias_create *create)
++{
++	return kbase_mem_low32_alias_create(kctx, create->user_addr, create->size, &create->cookie);
++}
++
+ static int kbase_api_mem_import(struct kbase_context *kctx, union kbase_ioctl_mem_import *import)
+ {
+ 	int ret;
+@@ -1750,6 +1756,11 @@ static long kbase_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		KBASE_HANDLE_IOCTL_INOUT(KBASE_IOCTL_MEM_ALIAS, kbase_api_mem_alias,
+ 					 union kbase_ioctl_mem_alias, kctx);
+ 		break;
++	case KBASE_IOCTL_MEM_LOW32_ALIAS_CREATE:
++		KBASE_HANDLE_IOCTL_INOUT(KBASE_IOCTL_MEM_LOW32_ALIAS_CREATE,
++					 kbase_api_mem_low32_alias_create,
++					 struct kbase_ioctl_mem_low32_alias_create, kctx);
++		break;
+ 	case KBASE_IOCTL_MEM_IMPORT:
+ 		KBASE_HANDLE_IOCTL_INOUT(KBASE_IOCTL_MEM_IMPORT, kbase_api_mem_import,
+ 					 union kbase_ioctl_mem_import, kctx);
+diff --git a/drivers/gpu/arm/valhall/mali_kbase_ioctl_helpers.h b/drivers/gpu/arm/valhall/mali_kbase_ioctl_helpers.h
+index 04848fcd177c..4701b1537693 100644
+--- a/drivers/gpu/arm/valhall/mali_kbase_ioctl_helpers.h
++++ b/drivers/gpu/arm/valhall/mali_kbase_ioctl_helpers.h
+@@ -187,6 +187,12 @@ static inline int check_padding_KBASE_IOCTL_MEM_ALIAS(union kbase_ioctl_mem_alia
+ 	return 0;
+ }
+ 
++static inline int check_padding_KBASE_IOCTL_MEM_LOW32_ALIAS_CREATE(
++	struct kbase_ioctl_mem_low32_alias_create *p)
++{
++	return 0;
++}
++
+ static inline int check_padding_KBASE_IOCTL_MEM_IMPORT(union kbase_ioctl_mem_import *p)
+ {
+ 	return 0;
+diff --git a/drivers/gpu/arm/valhall/mali_kbase_mem.c b/drivers/gpu/arm/valhall/mali_kbase_mem.c
+index 9a6ad0991f14..711cd4e00516 100644
+--- a/drivers/gpu/arm/valhall/mali_kbase_mem.c
++++ b/drivers/gpu/arm/valhall/mali_kbase_mem.c
+@@ -609,9 +609,9 @@ int kbase_gpu_munmap(struct kbase_context *kctx, struct kbase_va_region *reg)
+ 	return err;
+ }
+ 
+-static struct kbase_cpu_mapping *kbasep_find_enclosing_cpu_mapping(struct kbase_context *kctx,
+-								   unsigned long uaddr, size_t size,
+-								   u64 *offset)
++struct kbase_cpu_mapping *kbasep_find_enclosing_cpu_mapping(struct kbase_context *kctx,
++							    unsigned long uaddr, size_t size,
++							    u64 *offset)
+ {
+ 	struct vm_area_struct *vma;
+ 	struct kbase_cpu_mapping *map;
+diff --git a/drivers/gpu/arm/valhall/mali_kbase_mem.h b/drivers/gpu/arm/valhall/mali_kbase_mem.h
+index ea13c5a393b5..ee7eef144c23 100644
+--- a/drivers/gpu/arm/valhall/mali_kbase_mem.h
++++ b/drivers/gpu/arm/valhall/mali_kbase_mem.h
+@@ -201,6 +201,7 @@ static inline void kbase_process_page_usage_inc(struct kbase_context *kctx, int
+ #define KBASE_REG_RESERVED_BIT_23 (1ul << 23)
+ 
+ /* Bit 24 is currently unused and is available for use for a new flag */
++#define KBASE_REG_LOW32_ALIAS (1ul << 24)
+ 
+ /* Memory has permanent kernel side mapping */
+ #define KBASE_REG_PERMANENT_KERNEL_MAPPING (1ul << 25)
+@@ -1640,6 +1641,25 @@ static inline void kbase_process_page_usage_dec(struct kbase_context *kctx, int
+ int kbasep_find_enclosing_cpu_mapping_offset(struct kbase_context *kctx, unsigned long uaddr,
+ 					     size_t size, u64 *offset);
+ 
++/**
++ * kbasep_find_enclosing_cpu_mapping() - Find the CPU mapping containing a
++ *                                       given address range
++ *
++ * @kctx:      The kernel base context used for the allocation.
++ * @uaddr:     Start of the CPU virtual address range.
++ * @size:      Size of the CPU virtual address range (in bytes).
++ * @offset:    The offset from the start of the allocation to the specified CPU
++ *             virtual address.
++ *
++ * The caller must hold the process mmap lock, for example via
++ * kbase_os_mem_map_lock().
++ *
++ * Return: The CPU mapping if the range is fully enclosed, NULL otherwise.
++ */
++struct kbase_cpu_mapping *kbasep_find_enclosing_cpu_mapping(struct kbase_context *kctx,
++							    unsigned long uaddr, size_t size,
++							    u64 *offset);
++
+ /**
+  * kbasep_find_enclosing_gpu_mapping_start_and_offset() - Find the address of
+  * the start of GPU virtual memory region which encloses @gpu_addr for the
+diff --git a/drivers/gpu/arm/valhall/mali_kbase_mem_linux.c b/drivers/gpu/arm/valhall/mali_kbase_mem_linux.c
+index 4e6bc10b231e..2a6d3bb0e824 100644
+--- a/drivers/gpu/arm/valhall/mali_kbase_mem_linux.c
++++ b/drivers/gpu/arm/valhall/mali_kbase_mem_linux.c
+@@ -1950,6 +1950,189 @@ u64 kbase_mem_alias(struct kbase_context *kctx, base_mem_alloc_flags *flags, u64
+ 	return 0;
+ }
+ 
++int kbase_mem_low32_alias_create(struct kbase_context *kctx, u64 user_addr, u64 size, u64 *cookie)
++{
++	struct kbase_cpu_mapping *src_map;
++	struct kbase_va_region *src_reg;
++	struct base_mem_aliasing_info alias_info = { 0 };
++	base_mem_alloc_flags alias_flags = 0;
++	base_mem_alloc_flags src_reg_flags = 0;
++	u64 mapping_offset = 0;
++	u64 end_addr;
++	u64 aligned_end_offset;
++	u64 backed_pages;
++	u64 alias_handle;
++	u64 alias_pages;
++	unsigned long aligned_user_addr;
++	size_t aligned_size;
++	unsigned int cookie_nr;
++	int ret = 0;
++
++	if (!cookie || !size) {
++		dev_warn_ratelimited(kctx->kbdev->dev,
++				     "low32 alias reject: invalid args user_addr=0x%llx size=0x%llx cookie=%pK\n",
++				     (unsigned long long)user_addr, (unsigned long long)size, cookie);
++		return -EINVAL;
++	}
++
++	*cookie = 0;
++
++	end_addr = user_addr + size;
++	if (end_addr < user_addr) {
++		dev_warn_ratelimited(kctx->kbdev->dev,
++				     "low32 alias reject: address overflow user_addr=0x%llx size=0x%llx\n",
++				     (unsigned long long)user_addr, (unsigned long long)size);
++		return -EINVAL;
++	}
++
++	aligned_user_addr = (unsigned long)(user_addr & PAGE_MASK);
++	aligned_size = PAGE_ALIGN(end_addr - aligned_user_addr);
++	if (!aligned_size) {
++		dev_warn_ratelimited(kctx->kbdev->dev,
++				     "low32 alias reject: aligned size is zero user_addr=0x%llx size=0x%llx\n",
++				     (unsigned long long)user_addr, (unsigned long long)size);
++		return -EINVAL;
++	}
++
++	kbase_os_mem_map_lock(kctx);
++
++	src_map = kbasep_find_enclosing_cpu_mapping(kctx, aligned_user_addr, aligned_size,
++						    &mapping_offset);
++	if (!src_map) {
++		dev_warn_ratelimited(kctx->kbdev->dev,
++				     "low32 alias reject: no source cpu mapping user_addr=0x%llx aligned_user_addr=0x%lx size=0x%zx\n",
++				     (unsigned long long)user_addr, aligned_user_addr, aligned_size);
++		ret = -EINVAL;
++		goto out_unlock_map;
++	}
++
++	src_reg = src_map->region;
++	if (kbase_is_region_invalid_or_free(src_reg) || kbase_is_region_shrinkable(src_reg) ||
++	    kbase_va_region_is_no_user_free(src_reg) ||
++	    !(src_reg->flags & (KBASE_REG_CPU_RD | KBASE_REG_CPU_WR)) ||
++	    (src_reg->flags & (KBASE_REG_IMPORT_PAD | KBASE_REG_CSF_EVENT | KBASE_REG_PROTECTED)) ||
++	    !src_reg->cpu_alloc || !src_reg->gpu_alloc ||
++	    src_reg->cpu_alloc->type != KBASE_MEM_TYPE_NATIVE ||
++	    src_reg->gpu_alloc->type != KBASE_MEM_TYPE_NATIVE) {
++		dev_warn_ratelimited(
++			kctx->kbdev->dev,
++			"low32 alias reject: unsupported source flags=0x%lx cpu_alloc=%d gpu_alloc=%d user_addr=0x%llx size=0x%zx\n",
++			src_reg->flags,
++			src_reg->cpu_alloc ? (int)src_reg->cpu_alloc->type : -1,
++			src_reg->gpu_alloc ? (int)src_reg->gpu_alloc->type : -1,
++			(unsigned long long)user_addr, aligned_size);
++		ret = -EINVAL;
++		goto out_unlock_map;
++	}
++
++	aligned_end_offset = mapping_offset + aligned_size;
++	if (aligned_end_offset < mapping_offset) {
++		dev_warn_ratelimited(
++			kctx->kbdev->dev,
++			"low32 alias reject: offset overflow mapping_offset=0x%llx aligned_size=0x%zx user_addr=0x%llx\n",
++			(unsigned long long)mapping_offset, aligned_size,
++			(unsigned long long)user_addr);
++		ret = -EINVAL;
++		goto out_unlock_map;
++	}
++
++	backed_pages = kbase_reg_current_backed_size(src_reg);
++	if ((mapping_offset >> PAGE_SHIFT) >= backed_pages ||
++	    PFN_UP(aligned_end_offset) > backed_pages) {
++		dev_warn_ratelimited(
++			kctx->kbdev->dev,
++			"low32 alias reject: range outside backed pages mapping_offset=0x%llx end_offset=0x%llx backed_pages=0x%llx user_addr=0x%llx\n",
++			(unsigned long long)mapping_offset,
++			(unsigned long long)aligned_end_offset,
++			(unsigned long long)backed_pages,
++			(unsigned long long)user_addr);
++		ret = -EINVAL;
++		goto out_unlock_map;
++	}
++
++	src_reg_flags = src_reg->flags;
++
++	if (src_reg_flags & KBASE_REG_CPU_RD)
++		alias_flags |= BASE_MEM_PROT_CPU_RD;
++	if (src_reg_flags & KBASE_REG_CPU_WR)
++		alias_flags |= BASE_MEM_PROT_CPU_WR;
++	if (src_reg_flags & KBASE_REG_GPU_RD)
++		alias_flags |= BASE_MEM_PROT_GPU_RD;
++	if (src_reg_flags & KBASE_REG_GPU_WR)
++		alias_flags |= BASE_MEM_PROT_GPU_WR;
++	if (src_reg_flags & KBASE_REG_CPU_CACHED)
++		alias_flags |= BASE_MEM_CACHED_CPU;
++	if (src_reg_flags & KBASE_REG_SHARE_BOTH)
++		alias_flags |= BASE_MEM_COHERENT_SYSTEM;
++	else if (src_reg_flags & KBASE_REG_SHARE_IN)
++		alias_flags |= BASE_MEM_COHERENT_LOCAL;
++
++	/*
++	 * Keep the process mmap lock held until the alias is created so the
++	 * source VMA can't be unmapped and recycled to a different region in
++	 * this context between validation and kbase_mem_alias().
++	 */
++	alias_info.gpu_va = src_reg->start_pfn << PAGE_SHIFT;
++	alias_info.offset = mapping_offset >> PAGE_SHIFT;
++	alias_info.length = PFN_UP(aligned_end_offset) - alias_info.offset;
++
++	alias_handle = kbase_mem_alias(kctx, &alias_flags, alias_info.length, 1, &alias_info,
++				       &alias_pages);
++	if (!alias_handle) {
++		dev_warn_ratelimited(
++			kctx->kbdev->dev,
++			"low32 alias reject: kbase_mem_alias failed gpu_va=0x%llx offset=0x%llx length=0x%llx flags=0x%llx\n",
++			(unsigned long long)alias_info.gpu_va,
++			(unsigned long long)alias_info.offset,
++			(unsigned long long)alias_info.length,
++			(unsigned long long)alias_flags);
++		ret = -ENOMEM;
++		goto out_unlock_map;
++	}
++
++	if (alias_handle < BASE_MEM_COOKIE_BASE || alias_handle >= BASE_MEM_FIRST_FREE_ADDRESS) {
++		dev_warn_ratelimited(kctx->kbdev->dev,
++				     "low32 alias reject: non-cookie handle 0x%llx for source gpu_va=0x%llx\n",
++				     (unsigned long long)alias_handle,
++				     (unsigned long long)alias_info.gpu_va);
++		ret = -EINVAL;
++		goto out_free_alias;
++	}
++
++	cookie_nr = PFN_DOWN(alias_handle - BASE_MEM_COOKIE_BASE);
++
++	kbase_gpu_vm_lock(kctx);
++	if (!kctx->pending_regions[cookie_nr]) {
++		kbase_gpu_vm_unlock(kctx);
++		dev_warn_ratelimited(kctx->kbdev->dev,
++				     "low32 alias reject: pending region missing for cookie=%u handle=0x%llx\n",
++				     cookie_nr, (unsigned long long)alias_handle);
++		ret = -EINVAL;
++		goto out_free_alias;
++	}
++
++	if (src_reg_flags & KBASE_REG_CPU_WR)
++		kctx->pending_regions[cookie_nr]->flags |= KBASE_REG_CPU_WR;
++	if (src_reg_flags & KBASE_REG_CPU_CACHED)
++		kctx->pending_regions[cookie_nr]->flags |= KBASE_REG_CPU_CACHED;
++	kctx->pending_regions[cookie_nr]->flags |= KBASE_REG_LOW32_ALIAS;
++	kbase_gpu_vm_unlock(kctx);
++
++	*cookie = alias_handle;
++	dev_dbg(kctx->kbdev->dev,
++		"low32 alias created: user_addr=0x%llx size=0x%llx cookie=0x%llx alias_pages=0x%llx\n",
++		(unsigned long long)user_addr, (unsigned long long)size,
++		(unsigned long long)alias_handle, (unsigned long long)alias_pages);
++
++out_unlock_map:
++	kbase_os_mem_map_unlock(kctx);
++	return ret;
++
++out_free_alias:
++	kbase_mem_free(kctx, alias_handle);
++	goto out_unlock_map;
++}
++
+ int kbase_mem_import(struct kbase_context *kctx, enum base_mem_import_type type,
+ 		     void __user *phandle, u32 padding, u64 *gpu_va, u64 *va_pages,
+ 		     base_mem_alloc_flags *flags)
+diff --git a/drivers/gpu/arm/valhall/mali_kbase_mem_linux.h b/drivers/gpu/arm/valhall/mali_kbase_mem_linux.h
+index 91869801e4fb..85cf38c9acde 100644
+--- a/drivers/gpu/arm/valhall/mali_kbase_mem_linux.h
++++ b/drivers/gpu/arm/valhall/mali_kbase_mem_linux.h
+@@ -103,6 +103,18 @@ int kbase_mem_import(struct kbase_context *kctx, enum base_mem_import_type type,
+ u64 kbase_mem_alias(struct kbase_context *kctx, base_mem_alloc_flags *flags, u64 stride, u64 nents,
+ 		    struct base_mem_aliasing_info *ai, u64 *num_pages);
+ 
++/**
++ * kbase_mem_low32_alias_create - Create a cookie-backed low-address alias for
++ *                                an existing userspace CPU mapping
++ * @kctx:      The kernel context
++ * @user_addr: CPU address inside the source mapping
++ * @size:      Size in bytes to alias
++ * @cookie:    Returned BASE_MEM_COOKIE-style handle
++ *
++ * Return: 0 on success or error code
++ */
++int kbase_mem_low32_alias_create(struct kbase_context *kctx, u64 user_addr, u64 size, u64 *cookie);
++
+ /**
+  * kbase_mem_flags_change - Change the flags for a memory region
+  *
+diff --git a/drivers/gpu/arm/valhall/thirdparty/mali_kbase_mmap.c b/drivers/gpu/arm/valhall/thirdparty/mali_kbase_mmap.c
+index 7750b1fef6a6..d5792a0ce29b 100644
+--- a/drivers/gpu/arm/valhall/thirdparty/mali_kbase_mmap.c
++++ b/drivers/gpu/arm/valhall/thirdparty/mali_kbase_mmap.c
+@@ -481,7 +481,9 @@ unsigned long kbase_context_get_unmapped_area(struct kbase_context *const kctx,
+ 			kbase_gpu_vm_unlock(kctx);
+ 			return -EINVAL;
+ 		}
+-		if (!(reg->flags & KBASE_REG_GPU_NX)) {
++		if (reg->flags & KBASE_REG_LOW32_ALIAS) {
++			high_limit = min_t(unsigned long, high_limit, 0x100000000ULL);
++		} else if (!(reg->flags & KBASE_REG_GPU_NX)) {
+ 			if (cpu_va_bits > gpu_pc_bits) {
+ 				align_offset = 1ULL << gpu_pc_bits;
+ 				align_mask = align_offset - 1;
+diff --git a/include/uapi/gpu/arm/valhall/mali_kbase_ioctl.h b/include/uapi/gpu/arm/valhall/mali_kbase_ioctl.h
+index 1a94adfba0be..8933e19865a4 100644
+--- a/include/uapi/gpu/arm/valhall/mali_kbase_ioctl.h
++++ b/include/uapi/gpu/arm/valhall/mali_kbase_ioctl.h
+@@ -605,6 +605,22 @@ struct kbase_ioctl_tlstream_stats {
+  *         _IOWR(KBASE_IOCTL_EXTRA_TYPE, 0, struct my_ioctl_args)
+  */
+ 
++/**
++ * struct kbase_ioctl_mem_low32_alias_create - Create a low-address CPU alias
++ *                                             for an existing CPU mapping
++ * @user_addr: Existing userspace CPU address within the source kbase mapping.
++ * @size:      Size in bytes of the range to alias.
++ * @cookie:    Returned BASE_MEM_COOKIE-style handle for mmap().
++ */
++struct kbase_ioctl_mem_low32_alias_create {
++	__u64 user_addr;
++	__u64 size;
++	__u64 cookie;
++};
++
++#define KBASE_IOCTL_MEM_LOW32_ALIAS_CREATE \
++	_IOWR(KBASE_IOCTL_EXTRA_TYPE, 0, struct kbase_ioctl_mem_low32_alias_create)
++
+ /**********************************
+  * Definitions for GPU properties *
+  **********************************/
+-- 
+2.43.0

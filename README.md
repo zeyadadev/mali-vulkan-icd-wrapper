@@ -130,13 +130,17 @@ Why this exists:
 
 Repository-specific details:
 
-- the included kernel patch targets the active `bifrost/` Mali driver tree used by `zeyadadev/linux-rockchip`
+- the active RK3588 path in `zeyadadev/linux-rockchip` is now `valhall/`, and that is the default kernel patch target here
+- a `bifrost/` variant is still included for older or differently configured kernels
 - if the patched kernel is not installed, the wrapper automatically falls back to shadow mode
 
 Included files:
 
-- patch: `patches/kernel/0001-mali-add-bifrost-low32-alias-mapping-support.patch`
+- patches:
+  - `patches/kernel/0001-mali-add-valhall-low32-alias-mapping-support.patch`
+  - `patches/kernel/0002-mali-add-bifrost-low32-alias-mapping-support.patch`
 - helper script: `scripts/kernel/build_patched_linux_rockchip.sh`
+- background note: [docs/linux-rockchip-mali-driver-status.md](docs/linux-rockchip-mali-driver-status.md)
 
 Recommended scripted flow:
 
@@ -148,7 +152,9 @@ By default, the script:
 
 - clones `https://github.com/zeyadadev/linux-rockchip.git`
 - checks out `rk-6.1-rkr6.1`
-- applies the included git-format patch with `git am`
+- selects the Mali patch set with `KERNEL_MALI_DRIVER=valhall|bifrost`
+- defaults to `KERNEL_MALI_DRIVER=valhall`
+- applies the selected git-format patch with `git am`
 - seeds `.config` from the currently running kernel if available
 - builds Debian packages with `make bindeb-pkg`
 - can optionally install the generated packages and reboot
@@ -158,6 +164,7 @@ Notes:
 - `bindeb-pkg` uses significantly more disk space than a plain `make Image dtbs modules` build
 - if `/home` is small, override `KERNEL_DIR` to a path on a larger filesystem
 - the script manages its own clone; resetting that clone is safe, but do not point it at a kernel worktree that contains unrelated local work you want to keep
+- the exported patch files contain the alias implementation only; keep the driver-selection config in your kernel repo or config fragment
 
 Manual kernel build is also supported. In that case, make sure you install the matching modules as well as the kernel image, because booting a new `Image` with old modules can break driver loading after reboot.
 

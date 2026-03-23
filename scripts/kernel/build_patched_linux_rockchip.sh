@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PATCH_DIR="${ROOT_DIR}/patches/kernel"
-PATCH_FILE="${KERNEL_PATCH_FILE:-${PATCH_DIR}/0001-mali-add-bifrost-low32-alias-mapping-support.patch}"
+PATCH_FILE="${KERNEL_PATCH_FILE:-}"
 KERNEL_REPO="${KERNEL_REPO:-https://github.com/zeyadadev/linux-rockchip.git}"
 KERNEL_BRANCH="${KERNEL_BRANCH:-rk-6.1-rkr6.1}"
 KERNEL_DIR="${KERNEL_DIR:-${ROOT_DIR}/third_party/linux-rockchip}"
@@ -18,7 +18,9 @@ APPLY_PATCH="${KERNEL_APPLY_PATCH:-true}"
 INSTALL_PACKAGES="${KERNEL_INSTALL_PACKAGES:-false}"
 REBOOT_AFTER_INSTALL="${KERNEL_REBOOT_AFTER_INSTALL:-false}"
 INTERACTIVE_MODE="${KERNEL_INTERACTIVE:-auto}"
+KERNEL_MALI_DRIVER="${KERNEL_MALI_DRIVER:-valhall}"
 BUILD_START_STAMP=""
+RESOLVED_PATCH_FILE=""
 
 is_true() {
     case "${1,,}" in
@@ -75,6 +77,26 @@ prompt_yes_no() {
     done
 }
 
+resolve_kernel_patch_file() {
+    if [[ -n "${PATCH_FILE}" ]]; then
+        printf '%s\n' "${PATCH_FILE}"
+        return
+    fi
+
+    case "${KERNEL_MALI_DRIVER,,}" in
+        valhall)
+            printf '%s\n' "${PATCH_DIR}/0001-mali-add-valhall-low32-alias-mapping-support.patch"
+            ;;
+        bifrost)
+            printf '%s\n' "${PATCH_DIR}/0002-mali-add-bifrost-low32-alias-mapping-support.patch"
+            ;;
+        *)
+            echo "Unsupported KERNEL_MALI_DRIVER: ${KERNEL_MALI_DRIVER}. Expected 'valhall' or 'bifrost'." >&2
+            exit 1
+            ;;
+    esac
+}
+
 run_as_root() {
     if [[ "${EUID}" -eq 0 ]]; then
         "$@"
@@ -91,6 +113,8 @@ run_as_root() {
 }
 
 configure_interactive_options_if_requested() {
+    RESOLVED_PATCH_FILE="$(resolve_kernel_patch_file)"
+
     if ! is_interactive_enabled; then
         return
     fi
@@ -100,7 +124,8 @@ configure_interactive_options_if_requested() {
     echo "This script will:"
     echo "  - clone or refresh ${KERNEL_REPO} into ${KERNEL_DIR}"
     echo "  - optionally reset and clean that managed clone"
-    echo "  - apply ${PATCH_FILE}"
+    echo "  - target Mali driver ${KERNEL_MALI_DRIVER}"
+    echo "  - apply ${RESOLVED_PATCH_FILE}"
     echo "  - seed .config from the current system or KERNEL_CONFIG_SOURCE"
     echo "  - build Debian kernel packages with bindeb-pkg"
     echo "  - optionally install the generated packages"
@@ -226,13 +251,17 @@ apply_kernel_patch_if_requested() {
         return
     fi
 
-    if [[ ! -f "${PATCH_FILE}" ]]; then
-        echo "Kernel patch file not found: ${PATCH_FILE}" >&2
+    if [[ -z "${RESOLVED_PATCH_FILE}" ]]; then
+        RESOLVED_PATCH_FILE="$(resolve_kernel_patch_file)"
+    fi
+
+    if [[ ! -f "${RESOLVED_PATCH_FILE}" ]]; then
+        echo "Kernel patch file not found: ${RESOLVED_PATCH_FILE}" >&2
         exit 1
     fi
 
-    echo "Applying kernel patch ${PATCH_FILE}"
-    git -C "${KERNEL_DIR}" am --3way "${PATCH_FILE}"
+    echo "Applying kernel patch ${RESOLVED_PATCH_FILE}"
+    git -C "${KERNEL_DIR}" am --3way "${RESOLVED_PATCH_FILE}"
 }
 
 resolve_kernel_config_source() {
