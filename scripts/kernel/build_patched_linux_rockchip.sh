@@ -3,10 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PATCH_DIR="${ROOT_DIR}/patches/kernel"
+MANAGED_KERNEL_DIR="${ROOT_DIR}/third_party/linux-rockchip"
 PATCH_FILE="${KERNEL_PATCH_FILE:-}"
 KERNEL_REPO="${KERNEL_REPO:-https://github.com/zeyadadev/linux-rockchip.git}"
 KERNEL_BRANCH="${KERNEL_BRANCH:-rk-6.1-rkr6.1}"
-KERNEL_DIR="${KERNEL_DIR:-${ROOT_DIR}/third_party/linux-rockchip}"
+KERNEL_DIR="${KERNEL_DIR:-${MANAGED_KERNEL_DIR}}"
 KERNEL_ARCH="${KERNEL_ARCH:-arm64}"
 KERNEL_JOBS="${KERNEL_JOBS:-$(nproc)}"
 KERNEL_LOCALVERSION="${KERNEL_LOCALVERSION:--low32alias}"
@@ -21,6 +22,11 @@ INTERACTIVE_MODE="${KERNEL_INTERACTIVE:-auto}"
 KERNEL_MALI_DRIVER="${KERNEL_MALI_DRIVER:-valhall}"
 BUILD_START_STAMP=""
 RESOLVED_PATCH_FILE=""
+RESET_TREE_EXPLICIT="false"
+
+if [[ -n "${KERNEL_RESET_TREE+x}" ]]; then
+    RESET_TREE_EXPLICIT="true"
+fi
 
 is_true() {
     case "${1,,}" in
@@ -97,6 +103,19 @@ resolve_kernel_patch_file() {
     esac
 }
 
+canonicalize_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m "$1"
+        return
+    fi
+
+    printf '%s\n' "$1"
+}
+
+using_managed_kernel_dir() {
+    [[ "$(canonicalize_path "${KERNEL_DIR}")" == "$(canonicalize_path "${MANAGED_KERNEL_DIR}")" ]]
+}
+
 run_as_root() {
     if [[ "${EUID}" -eq 0 ]]; then
         "$@"
@@ -115,6 +134,12 @@ run_as_root() {
 configure_interactive_options_if_requested() {
     RESOLVED_PATCH_FILE="$(resolve_kernel_patch_file)"
 
+    if [[ -d "${KERNEL_DIR}/.git" ]] &&
+       ! using_managed_kernel_dir &&
+       [[ "${RESET_TREE_EXPLICIT}" != "true" ]]; then
+        RESET_TREE="false"
+    fi
+
     if ! is_interactive_enabled; then
         return
     fi
@@ -123,7 +148,8 @@ configure_interactive_options_if_requested() {
     echo "Interactive mode enabled."
     echo "This script will:"
     echo "  - clone or refresh ${KERNEL_REPO} into ${KERNEL_DIR}"
-    echo "  - optionally reset and clean that managed clone"
+    echo "  - reuse an existing clone when ${KERNEL_DIR} already exists"
+    echo "  - optionally reset and clean the selected kernel tree"
     echo "  - target Mali driver ${KERNEL_MALI_DRIVER}"
     echo "  - apply ${RESOLVED_PATCH_FILE}"
     echo "  - seed .config from the current system or KERNEL_CONFIG_SOURCE"
@@ -142,7 +168,7 @@ configure_interactive_options_if_requested() {
         INSTALL_BUILD_DEPS="false"
     fi
 
-    if prompt_yes_no "Reset and clean the managed kernel clone before applying the patch?" "${RESET_TREE}"; then
+    if prompt_yes_no "Reset and clean the selected kernel tree before applying the patch?" "${RESET_TREE}"; then
         RESET_TREE="true"
     else
         RESET_TREE="false"
@@ -227,11 +253,32 @@ clone_or_refresh_kernel_tree() {
         return
     fi
 
-    echo "Refreshing existing kernel clone in ${KERNEL_DIR}"
-    git -C "${KERNEL_DIR}" remote set-url origin "${KERNEL_REPO}"
-    git -C "${KERNEL_DIR}" fetch origin "${KERNEL_BRANCH}"
+    echo "Detected existing kernel clone in ${KERNEL_DIR}"
+
+    if ! using_managed_kernel_dir && is_true "${RESET_TREE}" && [[ "${RESET_TREE_EXPLICIT}" != "true" ]]; then
+        echo "Using an existing external kernel tree; defaulting KERNEL_RESET_TREE=false to avoid destructive reset."
+        echo "Set KERNEL_RESET_TREE=1 explicitly if you want the script to reset and clean this tree."
+        RESET_TREE="false"
+    fi
+
+    if using_managed_kernel_dir; then
+        echo "Refreshing managed kernel clone in ${KERNEL_DIR}"
+        git -C "${KERNEL_DIR}" remote set-url origin "${KERNEL_REPO}"
+        git -C "${KERNEL_DIR}" fetch origin "${KERNEL_BRANCH}"
+    else
+        echo "Using existing external kernel tree in ${KERNEL_DIR}; leaving remotes unchanged"
+        if git -C "${KERNEL_DIR}" remote get-url origin >/dev/null 2>&1; then
+            git -C "${KERNEL_DIR}" fetch origin "${KERNEL_BRANCH}"
+        else
+            echo "No origin remote configured for ${KERNEL_DIR}; continuing without fetch"
+        fi
+    fi
 
     if is_true "${RESET_TREE}"; then
+        if ! git -C "${KERNEL_DIR}" rev-parse --verify --quiet "origin/${KERNEL_BRANCH}" >/dev/null; then
+            echo "Cannot reset ${KERNEL_DIR}: missing origin/${KERNEL_BRANCH}" >&2
+            exit 1
+        fi
         git -C "${KERNEL_DIR}" checkout -B "${KERNEL_BRANCH}" "origin/${KERNEL_BRANCH}"
         git -C "${KERNEL_DIR}" reset --hard "origin/${KERNEL_BRANCH}"
         git -C "${KERNEL_DIR}" clean -fdx
@@ -240,10 +287,15 @@ clone_or_refresh_kernel_tree() {
 
     if git -C "${KERNEL_DIR}" show-ref --verify --quiet "refs/heads/${KERNEL_BRANCH}"; then
         git -C "${KERNEL_DIR}" checkout "${KERNEL_BRANCH}"
-    else
+    elif git -C "${KERNEL_DIR}" rev-parse --verify --quiet "origin/${KERNEL_BRANCH}" >/dev/null; then
         git -C "${KERNEL_DIR}" checkout -b "${KERNEL_BRANCH}" "origin/${KERNEL_BRANCH}"
     fi
-    git -C "${KERNEL_DIR}" pull --ff-only origin "${KERNEL_BRANCH}"
+
+    if git -C "${KERNEL_DIR}" remote get-url origin >/dev/null 2>&1 &&
+       git -C "${KERNEL_DIR}" rev-parse --verify --quiet "origin/${KERNEL_BRANCH}" >/dev/null &&
+       [[ "$(git -C "${KERNEL_DIR}" rev-parse --abbrev-ref HEAD)" == "${KERNEL_BRANCH}" ]]; then
+        git -C "${KERNEL_DIR}" pull --ff-only origin "${KERNEL_BRANCH}"
+    fi
 }
 
 apply_kernel_patch_if_requested() {
@@ -258,6 +310,11 @@ apply_kernel_patch_if_requested() {
     if [[ ! -f "${RESOLVED_PATCH_FILE}" ]]; then
         echo "Kernel patch file not found: ${RESOLVED_PATCH_FILE}" >&2
         exit 1
+    fi
+
+    if git -C "${KERNEL_DIR}" apply --reverse --check "${RESOLVED_PATCH_FILE}" >/dev/null 2>&1; then
+        echo "Kernel patch already present in ${KERNEL_DIR}; skipping git am"
+        return
     fi
 
     echo "Applying kernel patch ${RESOLVED_PATCH_FILE}"

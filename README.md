@@ -140,7 +140,6 @@ Included files:
   - `patches/kernel/0001-mali-add-valhall-low32-alias-mapping-support.patch`
   - `patches/kernel/0002-mali-add-bifrost-low32-alias-mapping-support.patch`
 - helper script: `scripts/kernel/build_patched_linux_rockchip.sh`
-- background note: [docs/linux-rockchip-mali-driver-status.md](docs/linux-rockchip-mali-driver-status.md)
 
 Recommended scripted flow:
 
@@ -155,6 +154,7 @@ By default, the script:
 - selects the Mali patch set with `KERNEL_MALI_DRIVER=valhall|bifrost`
 - defaults to `KERNEL_MALI_DRIVER=valhall`
 - applies the selected git-format patch with `git am`
+- reuses an existing clone when `KERNEL_DIR` already points to a git checkout
 - seeds `.config` from the currently running kernel if available
 - builds Debian packages with `make bindeb-pkg`
 - can optionally install the generated packages and reboot
@@ -164,6 +164,8 @@ Notes:
 - `bindeb-pkg` uses significantly more disk space than a plain `make Image dtbs modules` build
 - if `/home` is small, override `KERNEL_DIR` to a path on a larger filesystem
 - the script manages its own clone; resetting that clone is safe, but do not point it at a kernel worktree that contains unrelated local work you want to keep
+- when `KERNEL_DIR` points to an existing external clone, the script leaves remotes unchanged and defaults `KERNEL_RESET_TREE=0` unless you override it explicitly
+- if the selected patch is already present in the target tree, the script skips `git am` and continues
 - the exported patch files contain the alias implementation only; keep the driver-selection config in your kernel repo or config fragment
 
 Manual kernel build is also supported. In that case, make sure you install the matching modules as well as the kernel image, because booting a new `Image` with old modules can break driver loading after reboot.
