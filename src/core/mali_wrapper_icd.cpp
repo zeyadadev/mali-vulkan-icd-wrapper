@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <cstdio>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <chrono>
 #include <mutex>
@@ -77,9 +78,107 @@ struct InstanceInfo {
     InstanceInfo(VkInstance inst) : instance(inst), ref_count(1), marked_for_destruction(false) {}
 };
 
+struct ManagedDeviceDispatch {
+    VkDevice device = VK_NULL_HANDLE;
+    VkInstance parent_instance = VK_NULL_HANDLE;
+    PFN_vkGetDeviceProcAddr get_device_proc_addr = nullptr;
+    PFN_vkDestroyDevice destroy_device = nullptr;
+    PFN_vkAllocateMemory allocate_memory = nullptr;
+    PFN_vkFreeMemory free_memory = nullptr;
+    PFN_vkMapMemory map_memory = nullptr;
+    PFN_vkUnmapMemory unmap_memory = nullptr;
+    PFN_vkFlushMappedMemoryRanges flush_mapped_memory_ranges = nullptr;
+    PFN_vkInvalidateMappedMemoryRanges invalidate_mapped_memory_ranges = nullptr;
+    PFN_vkMapMemory2KHR map_memory2_khr = nullptr;
+    PFN_vkVoidFunction map_memory2 = nullptr;
+    PFN_vkUnmapMemory2KHR unmap_memory2_khr = nullptr;
+    PFN_vkVoidFunction unmap_memory2 = nullptr;
+    PFN_vkQueueSubmit queue_submit = nullptr;
+    PFN_vkQueueSubmit2 queue_submit2 = nullptr;
+    PFN_vkQueueSubmit2KHR queue_submit2_khr = nullptr;
+    PFN_vkCreateImage create_image = nullptr;
+    PFN_vkCreateGraphicsPipelines create_graphics_pipelines = nullptr;
+
+    PFN_vkVoidFunction resolve_known_proc(const char* proc_name) const
+    {
+        if (proc_name == nullptr) {
+            return nullptr;
+        }
+
+        if (strcmp(proc_name, "vkGetDeviceProcAddr") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(get_device_proc_addr);
+        }
+        if (strcmp(proc_name, "vkDestroyDevice") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(destroy_device);
+        }
+        if (strcmp(proc_name, "vkAllocateMemory") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(allocate_memory);
+        }
+        if (strcmp(proc_name, "vkFreeMemory") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(free_memory);
+        }
+        if (strcmp(proc_name, "vkMapMemory") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(map_memory);
+        }
+        if (strcmp(proc_name, "vkUnmapMemory") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(unmap_memory);
+        }
+        if (strcmp(proc_name, "vkFlushMappedMemoryRanges") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(flush_mapped_memory_ranges);
+        }
+        if (strcmp(proc_name, "vkInvalidateMappedMemoryRanges") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(invalidate_mapped_memory_ranges);
+        }
+        if (strcmp(proc_name, "vkMapMemory2KHR") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(map_memory2_khr);
+        }
+        if (strcmp(proc_name, "vkMapMemory2") == 0) {
+            return map_memory2;
+        }
+        if (strcmp(proc_name, "vkUnmapMemory2KHR") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(unmap_memory2_khr);
+        }
+        if (strcmp(proc_name, "vkUnmapMemory2") == 0) {
+            return unmap_memory2;
+        }
+        if (strcmp(proc_name, "vkQueueSubmit") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
+        }
+        if (strcmp(proc_name, "vkQueueSubmit2") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(queue_submit2);
+        }
+        if (strcmp(proc_name, "vkQueueSubmit2KHR") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(queue_submit2_khr);
+        }
+        if (strcmp(proc_name, "vkCreateImage") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(create_image);
+        }
+        if (strcmp(proc_name, "vkCreateGraphicsPipelines") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(create_graphics_pipelines);
+        }
+
+        return nullptr;
+    }
+
+    PFN_vkVoidFunction resolve_proc(const char* proc_name) const
+    {
+        if (auto known = resolve_known_proc(proc_name)) {
+            return known;
+        }
+
+        if (get_device_proc_addr == nullptr || proc_name == nullptr) {
+            return nullptr;
+        }
+
+        return get_device_proc_addr(device, proc_name);
+    }
+};
+
 static std::unordered_map<VkInstance, std::unique_ptr<InstanceInfo>> managed_instances;
-static std::unordered_map<VkDevice, VkInstance> managed_devices;
+static std::unordered_map<VkDevice, std::shared_ptr<const ManagedDeviceDispatch>> managed_devices;
 static std::mutex instance_mutex;
+static std::shared_mutex managed_device_mutex;
+static std::atomic<uint64_t> managed_device_generation{1};
 static VkInstance latest_instance = VK_NULL_HANDLE;
 
 struct DeviceMemoryKey {
@@ -1261,12 +1360,152 @@ bool is_instance_valid(VkInstance instance) {
     return (it != managed_instances.end() && !it->second->marked_for_destruction);
 }
 
+template <typename T>
+static T resolve_mali_device_proc(PFN_vkGetDeviceProcAddr get_device_proc_addr, VkDevice device, const char* proc_name)
+{
+    if (get_device_proc_addr == nullptr || proc_name == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<T>(get_device_proc_addr(device, proc_name));
+}
+
+static std::shared_ptr<const ManagedDeviceDispatch> create_managed_device_dispatch(VkDevice device, VkInstance parent_instance)
+{
+    auto dispatch = std::make_shared<ManagedDeviceDispatch>();
+    dispatch->device = device;
+    dispatch->parent_instance = parent_instance;
+
+    auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
+    if (mali_proc_addr == nullptr || device == VK_NULL_HANDLE || parent_instance == VK_NULL_HANDLE) {
+        return dispatch;
+    }
+
+    dispatch->get_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        mali_proc_addr(parent_instance, "vkGetDeviceProcAddr"));
+    if (dispatch->get_device_proc_addr == nullptr) {
+        return dispatch;
+    }
+
+    dispatch->destroy_device = resolve_mali_device_proc<PFN_vkDestroyDevice>(
+        dispatch->get_device_proc_addr, device, "vkDestroyDevice");
+    dispatch->allocate_memory = resolve_mali_device_proc<PFN_vkAllocateMemory>(
+        dispatch->get_device_proc_addr, device, "vkAllocateMemory");
+    dispatch->free_memory = resolve_mali_device_proc<PFN_vkFreeMemory>(
+        dispatch->get_device_proc_addr, device, "vkFreeMemory");
+    dispatch->map_memory = resolve_mali_device_proc<PFN_vkMapMemory>(
+        dispatch->get_device_proc_addr, device, "vkMapMemory");
+    dispatch->unmap_memory = resolve_mali_device_proc<PFN_vkUnmapMemory>(
+        dispatch->get_device_proc_addr, device, "vkUnmapMemory");
+    dispatch->flush_mapped_memory_ranges = resolve_mali_device_proc<PFN_vkFlushMappedMemoryRanges>(
+        dispatch->get_device_proc_addr, device, "vkFlushMappedMemoryRanges");
+    dispatch->invalidate_mapped_memory_ranges = resolve_mali_device_proc<PFN_vkInvalidateMappedMemoryRanges>(
+        dispatch->get_device_proc_addr, device, "vkInvalidateMappedMemoryRanges");
+    dispatch->map_memory2_khr = resolve_mali_device_proc<PFN_vkMapMemory2KHR>(
+        dispatch->get_device_proc_addr, device, "vkMapMemory2KHR");
+    dispatch->map_memory2 = resolve_mali_device_proc<PFN_vkVoidFunction>(
+        dispatch->get_device_proc_addr, device, "vkMapMemory2");
+    dispatch->unmap_memory2_khr = resolve_mali_device_proc<PFN_vkUnmapMemory2KHR>(
+        dispatch->get_device_proc_addr, device, "vkUnmapMemory2KHR");
+    dispatch->unmap_memory2 = resolve_mali_device_proc<PFN_vkVoidFunction>(
+        dispatch->get_device_proc_addr, device, "vkUnmapMemory2");
+    dispatch->queue_submit = resolve_mali_device_proc<PFN_vkQueueSubmit>(
+        dispatch->get_device_proc_addr, device, "vkQueueSubmit");
+    dispatch->queue_submit2 = resolve_mali_device_proc<PFN_vkQueueSubmit2>(
+        dispatch->get_device_proc_addr, device, "vkQueueSubmit2");
+    dispatch->queue_submit2_khr = resolve_mali_device_proc<PFN_vkQueueSubmit2KHR>(
+        dispatch->get_device_proc_addr, device, "vkQueueSubmit2KHR");
+    dispatch->create_image = resolve_mali_device_proc<PFN_vkCreateImage>(
+        dispatch->get_device_proc_addr, device, "vkCreateImage");
+    dispatch->create_graphics_pipelines = resolve_mali_device_proc<PFN_vkCreateGraphicsPipelines>(
+        dispatch->get_device_proc_addr, device, "vkCreateGraphicsPipelines");
+    return dispatch;
+}
+
+static void remember_managed_device(VkDevice device, VkInstance parent_instance)
+{
+    if (device == VK_NULL_HANDLE) {
+        return;
+    }
+
+    auto dispatch = create_managed_device_dispatch(device, parent_instance);
+    {
+        std::unique_lock<std::shared_mutex> lock(managed_device_mutex);
+        managed_devices[device] = std::move(dispatch);
+        managed_device_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+static std::shared_ptr<const ManagedDeviceDispatch> get_managed_device_dispatch(VkDevice device)
+{
+    if (device == VK_NULL_HANDLE) {
+        return nullptr;
+    }
+
+    thread_local uint64_t cached_generation = 0;
+    thread_local VkDevice cached_device = VK_NULL_HANDLE;
+    thread_local std::shared_ptr<const ManagedDeviceDispatch> cached_dispatch;
+
+    const uint64_t generation = managed_device_generation.load(std::memory_order_acquire);
+    if (cached_generation == generation && cached_device == device) {
+        return cached_dispatch;
+    }
+
+    std::shared_ptr<const ManagedDeviceDispatch> dispatch;
+    {
+        std::shared_lock<std::shared_mutex> lock(managed_device_mutex);
+        auto it = managed_devices.find(device);
+        if (it != managed_devices.end()) {
+            dispatch = it->second;
+        }
+    }
+
+    cached_generation = generation;
+    cached_device = device;
+    cached_dispatch = dispatch;
+    return dispatch;
+}
+
+static std::shared_ptr<const ManagedDeviceDispatch> forget_managed_device(VkDevice device)
+{
+    std::shared_ptr<const ManagedDeviceDispatch> dispatch;
+    {
+        std::unique_lock<std::shared_mutex> lock(managed_device_mutex);
+        auto it = managed_devices.find(device);
+        if (it != managed_devices.end()) {
+            dispatch = std::move(it->second);
+            managed_devices.erase(it);
+            managed_device_generation.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+    return dispatch;
+}
+
+static std::vector<VkDevice> forget_managed_devices_for_instance(VkInstance instance)
+{
+    std::vector<VkDevice> devices;
+    {
+        std::unique_lock<std::shared_mutex> lock(managed_device_mutex);
+        for (auto it = managed_devices.begin(); it != managed_devices.end(); ) {
+            if (it->second != nullptr && it->second->parent_instance == instance) {
+                devices.push_back(it->first);
+                it = managed_devices.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!devices.empty()) {
+            managed_device_generation.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+    return devices;
+}
+
 static VkInstance get_device_parent_instance(VkDevice device)
 {
-    auto it = managed_devices.find(device);
-    if (it != managed_devices.end())
-    {
-        return it->second;
+    auto dispatch = get_managed_device_dispatch(device);
+    if (dispatch != nullptr) {
+        return dispatch->parent_instance;
     }
 
     std::lock_guard<std::mutex> lock(instance_mutex);
@@ -1289,7 +1528,7 @@ static VkInstance get_device_parent_instance(VkDevice device)
 
 static VkDevice get_any_managed_device()
 {
-    std::lock_guard<std::mutex> lock(instance_mutex);
+    std::shared_lock<std::shared_mutex> lock(managed_device_mutex);
     if (managed_devices.empty()) {
         return VK_NULL_HANDLE;
     }
@@ -1909,14 +2148,10 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyInstance(
         }
     }
 
-    // Cleanup associated devices
-    for (auto dev_it = managed_devices.begin(); dev_it != managed_devices.end(); ) {
-        if (dev_it->second == instance) {
-            GetWSIManager().release_device(dev_it->first);
-            dev_it = managed_devices.erase(dev_it);
-        } else {
-            ++dev_it;
-        }
+    // Cleanup associated devices after removing them from the shared map.
+    const auto devices_to_release = forget_managed_devices_for_instance(instance);
+    for (VkDevice device : devices_to_release) {
+        GetWSIManager().release_device(device);
     }
 
     auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
@@ -2220,25 +2455,23 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures2KHR(
 template <typename T>
 static T get_mali_device_proc(VkDevice device, const char* proc_name)
 {
-    using namespace mali_wrapper;
-
-    auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
-    if (!mali_proc_addr) {
+    auto dispatch = mali_wrapper::get_managed_device_dispatch(device);
+    if (dispatch == nullptr) {
         return nullptr;
     }
 
-    VkInstance parent_instance = get_device_parent_instance(device);
-    if (parent_instance == VK_NULL_HANDLE) {
+    return reinterpret_cast<T>(dispatch->resolve_proc(proc_name));
+}
+
+template <typename T>
+static T get_mali_device_proc(VkDevice device, T mali_wrapper::ManagedDeviceDispatch::*member)
+{
+    auto dispatch = mali_wrapper::get_managed_device_dispatch(device);
+    if (dispatch == nullptr) {
         return nullptr;
     }
 
-    auto mali_get_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-        mali_proc_addr(parent_instance, "vkGetDeviceProcAddr"));
-    if (!mali_get_device_proc_addr) {
-        return nullptr;
-    }
-
-    return reinterpret_cast<T>(mali_get_device_proc_addr(device, proc_name));
+    return dispatch.get()->*member;
 }
 
 static void maybe_apply_low_address_mapping(VkDevice device, VkDeviceMemory memory,
@@ -2597,7 +2830,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkAllocateMemory(
 {
     using namespace mali_wrapper;
 
-    auto mali_allocate_memory = get_mali_device_proc<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
+    auto mali_allocate_memory = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::allocate_memory);
     if (!mali_allocate_memory) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -2646,7 +2879,7 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkFreeMemory(
         munmap(stale_mapping.unmap_ptr, stale_mapping.unmap_size);
     }
 
-    auto mali_free_memory = get_mali_device_proc<PFN_vkFreeMemory>(device, "vkFreeMemory");
+    auto mali_free_memory = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::free_memory);
     if (mali_free_memory) {
         mali_free_memory(device, memory, pAllocator);
     }
@@ -2660,7 +2893,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory(
     VkMemoryMapFlags flags,
     void** ppData)
 {
-    auto mali_map_memory = get_mali_device_proc<PFN_vkMapMemory>(device, "vkMapMemory");
+    auto mali_map_memory = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::map_memory);
     if (!mali_map_memory) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -2730,7 +2963,7 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkUnmapMemory(
         finalize_shadow_mapping(mapping);
     }
 
-    auto mali_unmap_memory = get_mali_device_proc<PFN_vkUnmapMemory>(device, "vkUnmapMemory");
+    auto mali_unmap_memory = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::unmap_memory);
     if (mali_unmap_memory) {
         mali_unmap_memory(device, memory);
     }
@@ -2741,7 +2974,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkFlushMappedMemoryRanges(
     uint32_t memoryRangeCount,
     const VkMappedMemoryRange* pMemoryRanges)
 {
-    auto mali_flush = get_mali_device_proc<PFN_vkFlushMappedMemoryRanges>(device, "vkFlushMappedMemoryRanges");
+    auto mali_flush = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::flush_mapped_memory_ranges);
     if (!mali_flush) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -2755,7 +2988,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkInvalidateMappedMemoryRanges(
     uint32_t memoryRangeCount,
     const VkMappedMemoryRange* pMemoryRanges)
 {
-    auto mali_invalidate = get_mali_device_proc<PFN_vkInvalidateMappedMemoryRanges>(device, "vkInvalidateMappedMemoryRanges");
+    auto mali_invalidate = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::invalidate_mapped_memory_ranges);
     if (!mali_invalidate) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -2776,10 +3009,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkMapMemory2KHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    auto mali_map_memory2 = get_mali_device_proc<PFN_vkMapMemory2KHR>(device, "vkMapMemory2KHR");
+    auto mali_map_memory2 = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::map_memory2_khr);
     if (!mali_map_memory2) {
         mali_map_memory2 = reinterpret_cast<PFN_vkMapMemory2KHR>(
-            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkMapMemory2"));
+            get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::map_memory2));
     }
     if (!mali_map_memory2) {
         // Some drivers do not expose VK_KHR_map_memory2 even though vkMapMemory works.
@@ -2806,10 +3039,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkUnmapMemory2KHR(
         }
     }
 
-    auto mali_unmap2 = get_mali_device_proc<PFN_vkUnmapMemory2KHR>(device, "vkUnmapMemory2KHR");
+    auto mali_unmap2 = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::unmap_memory2_khr);
     if (!mali_unmap2) {
         mali_unmap2 = reinterpret_cast<PFN_vkUnmapMemory2KHR>(
-            get_mali_device_proc<PFN_vkVoidFunction>(device, "vkUnmapMemory2"));
+            get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::unmap_memory2));
     }
     if (!mali_unmap2) {
         return VK_SUCCESS;
@@ -2832,12 +3065,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit(
     }
 
     auto mali_queue_submit = (device != VK_NULL_HANDLE)
-                                 ? get_mali_device_proc<PFN_vkQueueSubmit>(device, "vkQueueSubmit")
+                                 ? get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::queue_submit)
                                  : nullptr;
     if (!mali_queue_submit) {
         const VkDevice fallback_device = mali_wrapper::get_any_managed_device();
         if (fallback_device != VK_NULL_HANDLE) {
-            mali_queue_submit = get_mali_device_proc<PFN_vkQueueSubmit>(fallback_device, "vkQueueSubmit");
+            mali_queue_submit = get_mali_device_proc(fallback_device, &mali_wrapper::ManagedDeviceDispatch::queue_submit);
         }
     }
     if (!mali_queue_submit) {
@@ -2865,12 +3098,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit2(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    auto mali_queue_submit2 = get_mali_device_proc<PFN_vkQueueSubmit2>(device, "vkQueueSubmit2");
+    auto mali_queue_submit2 = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::queue_submit2);
     if (mali_queue_submit2) {
         return mali_queue_submit2(queue, submitCount, pSubmits, fence);
     }
 
-    auto mali_queue_submit2_khr = get_mali_device_proc<PFN_vkQueueSubmit2KHR>(device, "vkQueueSubmit2KHR");
+    auto mali_queue_submit2_khr = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::queue_submit2_khr);
     if (!mali_queue_submit2_khr) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -2896,12 +3129,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit2KHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    auto mali_queue_submit2_khr = get_mali_device_proc<PFN_vkQueueSubmit2KHR>(device, "vkQueueSubmit2KHR");
+    auto mali_queue_submit2_khr = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::queue_submit2_khr);
     if (mali_queue_submit2_khr) {
         return mali_queue_submit2_khr(queue, submitCount, pSubmits, fence);
     }
 
-    auto mali_queue_submit2 = get_mali_device_proc<PFN_vkQueueSubmit2>(device, "vkQueueSubmit2");
+    auto mali_queue_submit2 = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::queue_submit2);
     if (!mali_queue_submit2) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -2915,7 +3148,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateImage(
     const VkAllocationCallbacks* pAllocator,
     VkImage* pImage)
 {
-    auto mali_create_image = get_mali_device_proc<PFN_vkCreateImage>(device, "vkCreateImage");
+    auto mali_create_image = get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::create_image);
     if (mali_create_image == nullptr) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -2932,7 +3165,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateGraphicsPipelines(
     VkPipeline* pPipelines)
 {
     auto mali_create_graphics_pipelines =
-        get_mali_device_proc<PFN_vkCreateGraphicsPipelines>(device, "vkCreateGraphicsPipelines");
+        get_mali_device_proc(device, &mali_wrapper::ManagedDeviceDispatch::create_graphics_pipelines);
     if (mali_create_graphics_pipelines == nullptr) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -3027,18 +3260,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
         return nullptr;
     }
 
-    auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
-    if (mali_proc_addr) {
-        VkInstance parent_instance = get_device_parent_instance(device);
-        if (parent_instance != VK_NULL_HANDLE) {
-            auto mali_get_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                mali_proc_addr(parent_instance, "vkGetDeviceProcAddr"));
-            if (mali_get_device_proc_addr) {
-                auto func = mali_get_device_proc_addr(device, pName);
-                if (func) {
-                    return func;
-                }
-            }
+    auto dispatch = get_managed_device_dispatch(device);
+    if (dispatch != nullptr) {
+        if (auto func = dispatch->resolve_proc(pName)) {
+            return func;
         }
     }
 
@@ -3093,30 +3318,12 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL filtered_mali_get_device_proc_ad
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetDeviceProcAddr);
     }
 
-    auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
-    if (mali_proc_addr) {
-        VkInstance parent_instance = get_device_parent_instance(device);
-        if (parent_instance != VK_NULL_HANDLE) {
-            auto mali_get_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                mali_proc_addr(parent_instance, "vkGetDeviceProcAddr"));
-            if (mali_get_device_proc_addr) {
-                auto func = mali_get_device_proc_addr(device, pName);
-                if (func) {
-                    return func;
-                } else {
-                    return nullptr;
-                }
-            } else {
-                return nullptr;
-            }
-        } else {
-            return nullptr;
-        }
-    } else {
+    auto dispatch = get_managed_device_dispatch(device);
+    if (dispatch == nullptr) {
         return nullptr;
     }
 
-    return nullptr;
+    return dispatch->resolve_proc(pName);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL dummy_set_device_loader_data(VkDevice device, void* object) {
@@ -3241,7 +3448,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateDevice(
     if (result == VK_SUCCESS) {
         LOG_INFO("Device created successfully through Mali driver");
 
-        managed_devices.emplace(*pDevice, mali_instance);
+        remember_managed_device(*pDevice, mali_instance);
 
         VkInstance target_mali_instance = mali_instance;
         {
@@ -3293,18 +3500,25 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyDevice(
 
     remove_tracking_for_device(device);
 
-    VkInstance parent_instance = get_device_parent_instance(device);
+    auto device_dispatch = forget_managed_device(device);
+    VkInstance parent_instance = (device_dispatch != nullptr)
+                                     ? device_dispatch->parent_instance
+                                     : get_device_parent_instance(device);
 
-    if (managed_devices.find(device) == managed_devices.end()) {
+    if (device_dispatch == nullptr) {
         LOG_WARN("Destroying unmanaged device");
     }
 
     GetWSIManager().release_device(device);
 
-    auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
     PFN_vkDestroyDevice mali_destroy = nullptr;
 
-    if (mali_proc_addr && parent_instance != VK_NULL_HANDLE) {
+    if (device_dispatch != nullptr) {
+        mali_destroy = reinterpret_cast<PFN_vkDestroyDevice>(device_dispatch->resolve_proc("vkDestroyDevice"));
+    }
+
+    auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
+    if (!mali_destroy && mali_proc_addr && parent_instance != VK_NULL_HANDLE) {
         auto mali_get_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
             mali_proc_addr(parent_instance, "vkGetDeviceProcAddr"));
         if (mali_get_device_proc_addr) {
@@ -3324,8 +3538,6 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyDevice(
     } else {
         LOG_WARN("Failed to locate Mali vkDestroyDevice entry point");
     }
-
-    managed_devices.erase(device);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL mali_driver_create_device(
@@ -3416,7 +3628,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL mali_driver_create_device(
             }
         }
 
-        managed_devices.emplace(*pDevice, mali_instance);
+        remember_managed_device(*pDevice, mali_instance);
 
         VkResult wsi_result = GetWSIManager().init_device(target_mali_instance, physicalDevice, *pDevice,
                                                          modified_create_info.ppEnabledExtensionNames,
