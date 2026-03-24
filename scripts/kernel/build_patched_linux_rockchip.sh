@@ -357,7 +357,53 @@ seed_kernel_config() {
         cp "${config_source}" "${KERNEL_DIR}/.config"
     fi
 
+    configure_mali_driver
     make -C "${KERNEL_DIR}" ARCH="${KERNEL_ARCH}" olddefconfig
+}
+
+configure_mali_driver() {
+    local cfg="${KERNEL_DIR}/scripts/config"
+    local dot_config="${KERNEL_DIR}/.config"
+
+    case "${KERNEL_MALI_DRIVER,,}" in
+        valhall)
+            echo "Configuring kernel for Mali Valhall driver (DDK g29p1)"
+
+            # Disable Bifrost driver and all its sub-options
+            "${cfg}" --file "${dot_config}" \
+                --disable MALI_BIFROST \
+                --disable MALI_CSF_SUPPORT \
+                --disable MALI_BIFROST_DEVFREQ \
+                --disable MALI_BIFROST_GATOR_SUPPORT \
+                --disable MALI_BIFROST_ENABLE_TRACE \
+                --disable MALI_BIFROST_EXPERT \
+                --disable MALI_BIFROST_DEBUG \
+                --disable MALI_BIFROST_FENCE_DEBUG \
+                --disable MALI_BIFROST_SYSTEM_TRACE \
+                --disable MALI_CSF_INCLUDE_FW \
+                --disable MALI_TRACE_POWER_GPU_WORK_PERIOD
+
+            # Enable Valhall driver with RK3588 platform support
+            "${cfg}" --file "${dot_config}" \
+                --enable  MALI_VALHALL \
+                --set-str MALI_VALHALL_PLATFORM_NAME "rk" \
+                --enable  MALI_VALHALL_REAL_HW \
+                --enable  MALI_VALHALL_CSF_SUPPORT \
+                --enable  MALI_VALHALL_DEVFREQ \
+                --enable  MALI_VALHALL_GATOR_SUPPORT \
+                --enable  MALI_VALHALL_ENABLE_TRACE \
+                --enable  MALI_VALHALL_TRACE_POWER_GPU_WORK_PERIOD \
+                --enable  MALI_CSF_INCLUDE_FW
+            ;;
+        bifrost)
+            echo "Keeping Mali Bifrost driver configuration"
+            # Bifrost is the stock Rockchip default; nothing to change
+            ;;
+        *)
+            echo "Unsupported KERNEL_MALI_DRIVER: ${KERNEL_MALI_DRIVER}" >&2
+            exit 1
+            ;;
+    esac
 }
 
 build_kernel_packages() {
@@ -398,6 +444,86 @@ install_generated_packages_if_requested() {
     run_as_root dpkg -i "${GENERATED_PACKAGES[@]}"
 }
 
+detect_installed_kernel_version() {
+    local kernel_version=""
+    local pkg
+    for pkg in "${GENERATED_PACKAGES[@]}"; do
+        local base
+        base="$(basename "${pkg}")"
+        if [[ "${base}" == linux-image-[0-9]* ]]; then
+            kernel_version="${base#linux-image-}"
+            kernel_version="${kernel_version%%_*}"
+            break
+        fi
+    done
+
+    if [[ -z "${kernel_version}" ]]; then
+        local vmlinuz
+        vmlinuz="$(ls -t /boot/vmlinuz-*"${KERNEL_LOCALVERSION}" 2>/dev/null | head -1)"
+        if [[ -n "${vmlinuz}" ]]; then
+            kernel_version="$(basename "${vmlinuz}" | sed 's/^vmlinuz-//')"
+        fi
+    fi
+
+    printf '%s\n' "${kernel_version}"
+}
+
+configure_armbian_boot_if_requested() {
+    if ! is_true "${INSTALL_PACKAGES}"; then
+        return
+    fi
+
+    # Only run on Armbian-style systems that boot via /boot/Image symlink
+    if [[ ! -L /boot/Image ]]; then
+        return
+    fi
+
+    local kernel_version
+    kernel_version="$(detect_installed_kernel_version)"
+    if [[ -z "${kernel_version}" ]]; then
+        echo "Warning: could not detect installed kernel version; skipping boot configuration." >&2
+        return
+    fi
+
+    local vmlinuz="/boot/vmlinuz-${kernel_version}"
+    local initrd="/boot/initrd.img-${kernel_version}"
+    local dtb_src="/usr/lib/linux-image-${kernel_version}"
+    local dtb_dst="/boot/dtb-${kernel_version}"
+
+    if [[ ! -f "${vmlinuz}" ]]; then
+        echo "Warning: ${vmlinuz} not found; skipping boot configuration." >&2
+        return
+    fi
+
+    # Armbian U-Boot expects a raw ARM64 Image, but bindeb-pkg produces a
+    # gzip-compressed vmlinuz.  Decompress in-place when necessary.
+    if file "${vmlinuz}" | grep -q "gzip compressed"; then
+        echo "Decompressing ${vmlinuz} (Armbian requires uncompressed ARM64 Image)"
+        run_as_root mv "${vmlinuz}" "${vmlinuz}.gz"
+        run_as_root gunzip "${vmlinuz}.gz"
+    fi
+
+    # Copy device-tree blobs into /boot if the deb placed them under /usr/lib
+    if [[ -d "${dtb_src}" && ! -d "${dtb_dst}" ]]; then
+        echo "Copying device-tree blobs to ${dtb_dst}"
+        run_as_root cp -a "${dtb_src}" "${dtb_dst}"
+    fi
+
+    echo "Updating Armbian boot symlinks for ${kernel_version}"
+    run_as_root ln -sf "vmlinuz-${kernel_version}" /boot/Image
+
+    if [[ -f "${initrd}" ]]; then
+        run_as_root ln -sf "initrd.img-${kernel_version}" /boot/initrd.img
+    fi
+
+    if [[ -d "${dtb_dst}" ]]; then
+        run_as_root ln -sf "dtb-${kernel_version}" /boot/dtb
+    fi
+
+    echo "Boot configuration updated:"
+    ls -l /boot/Image /boot/initrd.img /boot/dtb 2>/dev/null | sed 's/^/  /'
+}
+
 reboot_if_requested() {
     if ! is_true "${REBOOT_AFTER_INSTALL}"; then
         return
@@ -430,6 +556,7 @@ main() {
     build_kernel_packages
     collect_generated_packages
     install_generated_packages_if_requested
+    configure_armbian_boot_if_requested
     reboot_if_requested
 }
 
