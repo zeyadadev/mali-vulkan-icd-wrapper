@@ -209,6 +209,7 @@ extract_g29_64bit_blob_if_requested() {
         local lib_dir=""
         lib_dir="$(dirname "${extracted_lib}")"
         run_as_root ln -sf "${extracted_lib}" "${lib_dir}/libmali.so"
+        run_as_root ln -sf "${extracted_lib}" "${lib_dir}/libmali.so.0"
     fi
 }
 
