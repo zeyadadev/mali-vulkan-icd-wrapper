@@ -318,6 +318,12 @@ apply_kernel_patch_if_requested() {
     fi
 
     echo "Applying kernel patch ${RESOLVED_PATCH_FILE}"
+    # Ensure a git identity exists so git-am can create the commit.
+    # Set it locally in the kernel tree to avoid touching the user's global config.
+    if ! git -C "${KERNEL_DIR}" config user.email >/dev/null 2>&1; then
+        git -C "${KERNEL_DIR}" config user.email "build@local"
+        git -C "${KERNEL_DIR}" config user.name  "Build Script"
+    fi
     git -C "${KERNEL_DIR}" am --3way "${RESOLVED_PATCH_FILE}"
 }
 
