@@ -442,6 +442,28 @@ install_generated_packages_if_requested() {
 
     echo "Installing generated Debian packages"
     run_as_root dpkg -i "${GENERATED_PACKAGES[@]}"
+    remove_old_kernel_packages
+}
+
+remove_old_kernel_packages() {
+    # Armbian's vendor kernel packages (linux-image-vendor-rk35xx, etc.) have
+    # postinst hooks that unconditionally overwrite /boot/Image and /boot/uInitrd
+    # symlinks.  Any future apt operation that reconfigures these packages will
+    # silently revert the system to the old kernel.  Remove them to prevent this.
+    local -a old_pkgs=()
+    local pkg
+    for pkg in $(dpkg -l 'linux-image-vendor-*' 'linux-dtb-vendor-*' 'linux-headers-vendor-*' 2>/dev/null \
+                 | awk '/^ii/ {print $2}'); do
+        old_pkgs+=("${pkg}")
+    done
+
+    if [[ "${#old_pkgs[@]}" -eq 0 ]]; then
+        return
+    fi
+
+    echo "Removing old Armbian vendor kernel packages to prevent boot symlink hijacking:"
+    printf '  %s\n' "${old_pkgs[@]}"
+    run_as_root apt-get purge --yes "${old_pkgs[@]}"
 }
 
 detect_installed_kernel_version() {
