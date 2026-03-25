@@ -188,6 +188,7 @@ install_build_dependencies_if_requested() {
         ninja-build
         ccache
         pkg-config
+        libssl-dev
         libxkbfile-dev
         libxshmfence-dev
         libxfont-dev
