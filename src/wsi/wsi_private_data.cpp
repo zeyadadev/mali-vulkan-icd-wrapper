@@ -778,6 +778,24 @@ device_private_data *device_private_data::try_get(VkDevice device)
    return it->second;
 }
 
+device_private_data *device_private_data::try_get(VkQueue queue)
+{
+   scoped_mutex lock(g_data_lock);
+   auto queue_key_it = g_queue_key_mapping.find(static_cast<void *>(queue));
+   if (queue_key_it == g_queue_key_mapping.end())
+   {
+      return nullptr;
+   }
+
+   auto device_it = g_device_data.find(queue_key_it->second);
+   if (device_it == g_device_data.end())
+   {
+      return nullptr;
+   }
+
+   return device_it->second;
+}
+
 device_private_data &device_private_data::get(VkQueue queue)
 {
    return get_device_private_data(queue);

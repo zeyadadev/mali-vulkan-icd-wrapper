@@ -2814,12 +2814,8 @@ static VkDevice get_queue_parent_device_safe(VkQueue queue)
         return VK_NULL_HANDLE;
     }
 
-    try {
-        auto& queue_device_data = mali_wrapper::device_private_data::get(queue);
-        return queue_device_data.device;
-    } catch (...) {
-        return VK_NULL_HANDLE;
-    }
+    auto* queue_device_data = mali_wrapper::device_private_data::try_get(queue);
+    return queue_device_data != nullptr ? queue_device_data->device : VK_NULL_HANDLE;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkAllocateMemory(
@@ -3189,10 +3185,6 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
         return nullptr;
     }
 
-    uintptr_t device_ptr = reinterpret_cast<uintptr_t>(device);
-    char hex_buffer[32];
-    snprintf(hex_buffer, sizeof(hex_buffer), "0x%lx", device_ptr);
-
     if (strcmp(pName, "vkDestroyDevice") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkDestroyDevice);
     }
@@ -3272,18 +3264,6 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
 
 static VKAPI_ATTR VkResult VKAPI_CALL wrapper_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pSwapchainCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain) {
     using namespace mali_wrapper;
-
-    uintptr_t device_ptr = reinterpret_cast<uintptr_t>(device);
-    char hex_buffer[32];
-    snprintf(hex_buffer, sizeof(hex_buffer), "0x%lx", device_ptr);
-
-
-    void* device_key = nullptr;
-    if (device != VK_NULL_HANDLE) {
-        device_key = *reinterpret_cast<void**>(device);
-        char key_hex[32];
-        snprintf(key_hex, sizeof(key_hex), "0x%lx", reinterpret_cast<uintptr_t>(device_key));
-    }
 
     void* wsi_lib = LibraryLoader::Instance().GetWSILibraryHandle();
     if (!wsi_lib) {

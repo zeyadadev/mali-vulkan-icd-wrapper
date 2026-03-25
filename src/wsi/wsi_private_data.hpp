@@ -804,6 +804,7 @@ public:
     * @brief Get the layer device object associated to the VkDevice owning the specified VkQueue.
     */
    static device_private_data &get(VkQueue queue);
+   static device_private_data *try_get(VkQueue queue);
 
    /**
     * @brief Add a swapchain to the swapchains member variable.
