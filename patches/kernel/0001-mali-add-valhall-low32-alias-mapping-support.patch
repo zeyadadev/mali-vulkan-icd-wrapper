@@ -189,8 +189,8 @@ index 4e6bc10b231e..2a6d3bb0e824 100644
 +	    src_reg->gpu_alloc->type != KBASE_MEM_TYPE_NATIVE) {
 +		dev_warn_ratelimited(
 +			kctx->kbdev->dev,
-+			"low32 alias reject: unsupported source flags=0x%lx cpu_alloc=%d gpu_alloc=%d user_addr=0x%llx size=0x%zx\n",
-+			src_reg->flags,
++			"low32 alias reject: unsupported source flags=0x%llx cpu_alloc=%d gpu_alloc=%d user_addr=0x%llx size=0x%zx\n",
++			(unsigned long long)src_reg->flags,
 +			src_reg->cpu_alloc ? (int)src_reg->cpu_alloc->type : -1,
 +			src_reg->gpu_alloc ? (int)src_reg->gpu_alloc->type : -1,
 +			(unsigned long long)user_addr, aligned_size);

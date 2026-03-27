@@ -402,8 +402,31 @@ configure_mali_driver() {
                 --enable  MALI_CSF_INCLUDE_FW
             ;;
         bifrost)
-            echo "Keeping Mali Bifrost driver configuration"
-            # Bifrost is the stock Rockchip default; nothing to change
+            echo "Configuring kernel for Mali Bifrost driver"
+
+            # Disable Valhall driver and all its sub-options
+            "${cfg}" --file "${dot_config}" \
+                --disable MALI_VALHALL \
+                --disable MALI_VALHALL_CSF_SUPPORT \
+                --disable MALI_VALHALL_DEVFREQ \
+                --disable MALI_VALHALL_GATOR_SUPPORT \
+                --disable MALI_VALHALL_ENABLE_TRACE \
+                --disable MALI_VALHALL_EXPERT \
+                --disable MALI_VALHALL_DEBUG \
+                --disable MALI_VALHALL_FENCE_DEBUG \
+                --disable MALI_VALHALL_SYSTEM_TRACE \
+                --disable MALI_VALHALL_TRACE_POWER_GPU_WORK_PERIOD
+
+            # Enable Bifrost driver with RK3588 platform support
+            "${cfg}" --file "${dot_config}" \
+                --enable  MALI_BIFROST \
+                --set-str MALI_PLATFORM_NAME "rk" \
+                --enable  MALI_REAL_HW \
+                --enable  MALI_CSF_SUPPORT \
+                --enable  MALI_BIFROST_DEVFREQ \
+                --enable  MALI_BIFROST_GATOR_SUPPORT \
+                --enable  MALI_BIFROST_ENABLE_TRACE \
+                --enable  MALI_CSF_INCLUDE_FW
             ;;
         *)
             echo "Unsupported KERNEL_MALI_DRIVER: ${KERNEL_MALI_DRIVER}" >&2
