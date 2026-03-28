@@ -64,7 +64,8 @@ private:
    int m_socket_fd = -1;
    bool m_connect_failed = false;
    bool m_feedback_probe_done = false;
-   bool m_feedback_sync_enabled = false;
+   bool m_feedback_sync_available = false;
+   bool m_feedback_wait_enabled = false;
    uint32_t m_feedback_timeout_ms = 250;
    uint32_t m_next_frame_id = 1;
 };

@@ -94,6 +94,12 @@ std::unique_ptr<xwayland_dmabuf_bridge_client> xwayland_dmabuf_bridge_client::cr
 xwayland_dmabuf_bridge_client::xwayland_dmabuf_bridge_client(std::string socket_path)
    : m_socket_path(std::move(socket_path))
 {
+   const char *wait_env = std::getenv("XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK");
+   if (wait_env && wait_env[0] != '\0' && !(wait_env[0] == '0' && wait_env[1] == '\0'))
+   {
+      m_feedback_wait_enabled = true;
+   }
+
    const char *timeout_env = std::getenv("XWL_DMABUF_BRIDGE_FEEDBACK_TIMEOUT_MS");
    if (timeout_env && timeout_env[0] != '\0')
    {
@@ -124,7 +130,7 @@ bool xwayland_dmabuf_bridge_client::is_enabled() const
 
 bool xwayland_dmabuf_bridge_client::is_feedback_sync_enabled() const
 {
-   return m_feedback_sync_enabled;
+   return m_feedback_sync_available && m_feedback_wait_enabled;
 }
 
 bool xwayland_dmabuf_bridge_client::present_frame(uint32_t xid, uint32_t width, uint32_t height, uint32_t fourcc,
@@ -173,7 +179,11 @@ bool xwayland_dmabuf_bridge_client::present_frame(uint32_t xid, uint32_t width, 
       return false;
    }
 
-   if (!m_feedback_sync_enabled)
+   WSI_LOG_DEBUG("Xwayland bridge: submitted frame=%u xid=0x%x size=%ux%u format=0x%x modifier=0x%llx planes=%u",
+                 packet.reserved, xid, width, height, fourcc,
+                 static_cast<unsigned long long>(modifier), num_planes);
+
+   if (!m_feedback_sync_available || !m_feedback_wait_enabled)
    {
       return true;
    }
@@ -184,9 +194,12 @@ bool xwayland_dmabuf_bridge_client::present_frame(uint32_t xid, uint32_t width, 
    {
       WSI_LOG_WARNING("Xwayland bridge: timed out waiting for feedback (frame=%u, xid=0x%x), disabling sync feedback",
                       packet.reserved, xid);
-      m_feedback_sync_enabled = false;
+      m_feedback_sync_available = false;
       return true;
    }
+
+   WSI_LOG_DEBUG("Xwayland bridge: feedback received for frame=%u xid=0x%x ack_xid=0x%x flags=0x%x",
+                 packet.reserved, xid, feedback_xid, feedback_flags);
 
    if (feedback_flags & XWL_DMABUF_BRIDGE_FEEDBACK_FAILED)
    {
@@ -267,7 +280,7 @@ bool xwayland_dmabuf_bridge_client::ensure_connected()
    m_socket_fd = fd;
    m_connect_failed = false;
    m_feedback_probe_done = false;
-   m_feedback_sync_enabled = false;
+   m_feedback_sync_available = false;
    WSI_LOG_INFO("Connected to Xwayland dmabuf bridge at %s", m_socket_path.c_str());
    (void) probe_feedback_support();
    return true;
@@ -277,7 +290,7 @@ bool xwayland_dmabuf_bridge_client::probe_feedback_support()
 {
    if (m_feedback_probe_done)
    {
-      return m_feedback_sync_enabled;
+      return m_feedback_sync_available;
    }
 
    m_feedback_probe_done = true;
@@ -303,8 +316,15 @@ bool xwayland_dmabuf_bridge_client::probe_feedback_support()
 
    if (feedback_flags & XWL_DMABUF_BRIDGE_FEEDBACK_CAP_SYNC)
    {
-      m_feedback_sync_enabled = true;
-      WSI_LOG_INFO("Xwayland bridge: sync feedback enabled (ack-based pacing)");
+      m_feedback_sync_available = true;
+      if (m_feedback_wait_enabled)
+      {
+         WSI_LOG_INFO("Xwayland bridge: sync feedback enabled (blocking ACK wait)");
+      }
+      else
+      {
+         WSI_LOG_INFO("Xwayland bridge: sync feedback available; non-blocking mode is active");
+      }
       return true;
    }
 
@@ -482,7 +502,7 @@ void xwayland_dmabuf_bridge_client::reset_connection()
       m_socket_fd = -1;
    }
    m_feedback_probe_done = false;
-   m_feedback_sync_enabled = false;
+   m_feedback_sync_available = false;
 }
 
 } /* namespace x11 */

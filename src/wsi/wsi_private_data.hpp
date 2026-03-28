@@ -48,6 +48,7 @@
 #include <unordered_set>
 #include <cassert>
 #include <mutex>
+#include <shared_mutex>
 #include <limits>
 #include <cstring>
 using scoped_mutex = std::lock_guard<std::mutex>;
@@ -873,6 +874,8 @@ public:
    const PFN_vkSetDeviceLoaderData SetDeviceLoaderData;
    const VkPhysicalDevice physical_device;
    const VkDevice device;
+   const bool supports_import_fence_fd;
+   const bool supports_import_semaphore_fd;
 
    /**
     * @brief Set Mali driver function pointers for device operations
@@ -948,6 +951,11 @@ public:
     * @return true if enabled, false otherwise.
     */
    bool is_swapchain_maintenance1_enabled() const;
+
+   bool supports_sync_fd_signal_import() const
+   {
+      return supports_import_fence_fd && supports_import_semaphore_fd;
+   }
 
 private:
    /* Allow util::allocator to access the private constructor */
