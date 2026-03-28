@@ -39,8 +39,6 @@
 #include <cstdint>
 #include <unordered_map>
 #include <chrono>
-#include <atomic>
-#include <mutex>
 #include <xcb/sync.h>
 
 namespace wsi
@@ -90,10 +88,6 @@ private:
    std::chrono::steady_clock::time_point m_last_frame_time;
    std::chrono::microseconds m_frame_interval;
    double m_refresh_rate_hz;
-
-   std::atomic<bool> m_thread_error_occurred{ false };
-   std::mutex m_error_recovery_mutex;
-
 
    VkResult create_graphics_context();
 

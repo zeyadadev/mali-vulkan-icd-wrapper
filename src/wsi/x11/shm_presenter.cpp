@@ -39,7 +39,6 @@
 #include <cstring>
 #include <algorithm>
 #include <thread>
-#include <future>
 #include <vector>
 #include <chrono>
 #include <cmath>
@@ -55,8 +54,6 @@ namespace wsi
 namespace x11
 {
 
-static constexpr uint32_t THREADING_PIXEL_THRESHOLD = 400 * 400;
-static constexpr uint32_t MAX_WORKER_THREADS = 8u;
 static constexpr uint32_t SIMD_VECTOR_SIZE = 4;
 static constexpr uint32_t LOOP_UNROLL_BOUNDARY = 3;
 static constexpr int SHM_PERMISSIONS = 0666;
@@ -348,89 +345,6 @@ void shm_presenter::copy_pixels_scalar(const uint32_t *src_pixels, uint32_t *dst
 void shm_presenter::copy_pixels_threaded(const uint32_t *src_pixels, uint32_t *dst_pixels, uint32_t src_stride_pixels,
                                          uint32_t dst_width, uint32_t height)
 {
-   if (!src_pixels || !dst_pixels || dst_width == 0 || height == 0)
-   {
-      return;
-   }
-
-   const uint32_t total_pixels = dst_width * height;
-
-   if (total_pixels > THREADING_PIXEL_THRESHOLD)
-   {
-      const uint32_t num_threads = std::min(std::thread::hardware_concurrency(), MAX_WORKER_THREADS);
-      if (num_threads > 1)
-      {
-         const uint32_t rows_per_thread = height / num_threads;
-         std::vector<std::future<void>> futures;
-         futures.reserve(num_threads);
-
-         try
-         {
-            for (uint32_t t = 0; t < num_threads; t++)
-            {
-               uint32_t start_row = t * rows_per_thread;
-               uint32_t end_row = (t == num_threads - 1) ? height : (t + 1) * rows_per_thread;
-
-               if (start_row >= height)
-                  break;
-               if (end_row > height)
-                  end_row = height;
-
-               futures.emplace_back(std::async(std::launch::async, [=]() {
-                  try
-                  {
-                     const uint32_t *thread_src = src_pixels + (start_row * src_stride_pixels);
-                     uint32_t *thread_dst = dst_pixels + (start_row * dst_width);
-                     uint32_t thread_height = end_row - start_row;
-
-                     if (thread_height > 0)
-                     {
-#ifdef ENABLE_ARM_NEON
-                        copy_pixels_simd(thread_src, thread_dst, src_stride_pixels, dst_width, thread_height);
-#else
-                        copy_pixels_scalar(thread_src, thread_dst, src_stride_pixels, dst_width, thread_height);
-#endif
-                     }
-                  }
-                  catch (const std::exception &e)
-                  {
-                     WSI_LOG_ERROR("Thread pixel copy failed with exception: %s", e.what());
-                     m_thread_error_occurred.store(true, std::memory_order_release);
-                  }
-                  catch (...)
-                  {
-                     WSI_LOG_ERROR("Thread pixel copy failed with unknown exception");
-                     m_thread_error_occurred.store(true, std::memory_order_release);
-                  }
-               }));
-            }
-
-            for (auto &future : futures)
-            {
-               if (future.valid())
-               {
-                  future.wait();
-               }
-            }
-
-            if (m_thread_error_occurred.load(std::memory_order_acquire))
-            {
-               std::lock_guard<std::mutex> lock(m_error_recovery_mutex);
-               WSI_LOG_ERROR("Thread errors detected, falling back to single-threaded processing");
-               m_thread_error_occurred.store(false, std::memory_order_release);
-               copy_pixels_optimized_single_thread(src_pixels, dst_pixels, src_stride_pixels, dst_width, height);
-            }
-         }
-         catch (...)
-         {
-            std::lock_guard<std::mutex> lock(m_error_recovery_mutex);
-            WSI_LOG_ERROR("Threading setup failed, falling back to single-threaded processing");
-            copy_pixels_optimized_single_thread(src_pixels, dst_pixels, src_stride_pixels, dst_width, height);
-         }
-         return;
-      }
-   }
-
    copy_pixels_optimized_single_thread(src_pixels, dst_pixels, src_stride_pixels, dst_width, height);
 }
 

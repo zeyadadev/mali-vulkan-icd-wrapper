@@ -33,15 +33,16 @@
 #include "layer_utils/macros.hpp"
 #include <cstdio>
 #include <stdexcept>
+#include <shared_mutex>
 #include <type_traits>
 #include <pthread.h>
 
 namespace mali_wrapper
 {
 
-static std::mutex g_data_lock;
+static std::shared_mutex g_data_lock;
 
-static void log_mutex_state(const char *tag, std::mutex &mutex_ref)
+static void log_mutex_state(const char *tag, std::shared_mutex &mutex_ref)
 {
    // Mutex logging disabled to reduce noise
 }
@@ -213,7 +214,7 @@ void register_queue_key_mapping(VkDevice device, VkQueue queue)
       return;
    }
 
-   scoped_mutex lock(g_data_lock);
+   std::unique_lock<std::shared_mutex> lock(g_data_lock);
 
    void *device_key = nullptr;
    auto device_key_it = g_device_key_mapping.find(static_cast<void *>(device));
@@ -251,7 +252,7 @@ VkResult instance_private_data::associate(VkInstance instance, instance_dispatch
                                           const util::allocator &allocator)
 {
    const auto key = get_key(instance);
-   scoped_mutex lock(g_data_lock);
+   std::unique_lock<std::shared_mutex> lock(g_data_lock);
 
    // CRITICAL FIX: Check if same Mali instance already exists (Box64+Wine-Wow64+DXVK)
    // Compare dispatch table pointers to detect same Mali instance with different keys
@@ -320,7 +321,7 @@ void instance_private_data::disassociate(VkInstance instance)
    assert(instance != VK_NULL_HANDLE);
    instance_private_data *instance_data = nullptr;
    {
-      scoped_mutex lock(g_data_lock);
+      std::unique_lock<std::shared_mutex> lock(g_data_lock);
       void *lookup_key = get_key(instance);
       auto key_it = g_instance_key_mapping.find(static_cast<void *>(instance));
       if (key_it != g_instance_key_mapping.end())
@@ -346,7 +347,7 @@ void instance_private_data::disassociate(VkInstance instance)
 template <typename dispatchable_type>
 static instance_private_data &get_instance_private_data(dispatchable_type dispatchable_object)
 {
-   scoped_mutex lock(g_data_lock);
+   std::shared_lock<std::shared_mutex> lock(g_data_lock);
    void *lookup_key = get_key(dispatchable_object);
    auto map_it = g_instance_key_mapping.find(static_cast<void *>(dispatchable_object));
    if (map_it != g_instance_key_mapping.end())
@@ -369,7 +370,7 @@ instance_private_data &instance_private_data::get(VkInstance instance)
       return get_instance_private_data(instance);
    } catch (const std::out_of_range&) {
       // CRITICAL FIX: If not found by dispatch table key, check if same VkInstance exists with different key
-      scoped_mutex lock(g_data_lock);
+      std::shared_lock<std::shared_mutex> lock(g_data_lock);
       for (auto& pair : g_instance_data) {
          if (pair.second && pair.second->get_instance_handle() == instance) {
             WSI_LOG_WARNING("get: Found same VkInstance %p with different key - reusing instance_data %p",
@@ -383,7 +384,7 @@ instance_private_data &instance_private_data::get(VkInstance instance)
 
 instance_private_data *instance_private_data::try_get(VkInstance instance)
 {
-   scoped_mutex lock(g_data_lock);
+   std::shared_lock<std::shared_mutex> lock(g_data_lock);
    void *lookup_key = get_key(instance);
    auto map_it = g_instance_key_mapping.find(static_cast<void *>(instance));
    if (map_it != g_instance_key_mapping.end())
@@ -558,6 +559,8 @@ device_private_data::device_private_data(instance_private_data &inst_data, VkPhy
    , SetDeviceLoaderData{ set_loader_data }
    , physical_device{ phys_dev }
    , device{ dev }
+   , supports_import_fence_fd{ disp.get_fn<PFN_vkImportFenceFdKHR>("vkImportFenceFdKHR").has_value() }
+   , supports_import_semaphore_fd{ disp.get_fn<PFN_vkImportSemaphoreFdKHR>("vkImportSemaphoreFdKHR").has_value() }
    , allocator{ alloc }
    , swapchains{ allocator } /* clang-format off */
    , enabled_extensions{ allocator }
@@ -588,7 +591,7 @@ VkResult device_private_data::associate(VkDevice dev, instance_private_data &ins
 
    const auto dispatch_key = get_key(dev);
    void *store_key = dispatch_key;
-   scoped_mutex lock(g_data_lock);
+   std::unique_lock<std::shared_mutex> lock(g_data_lock);
 
    auto key_mapping_it = g_device_key_mapping.find(static_cast<void *>(dev));
    if (key_mapping_it != g_device_key_mapping.end())
@@ -647,7 +650,7 @@ void device_private_data::disassociate(VkDevice dev)
    device_private_data *device_data = nullptr;
    void *stored_device_key = nullptr;
    {
-      scoped_mutex lock(g_data_lock);
+      std::unique_lock<std::shared_mutex> lock(g_data_lock);
 
       void *lookup_key = get_key(dev);
       auto key_it = g_device_key_mapping.find(static_cast<void *>(dev));
@@ -694,7 +697,7 @@ void device_private_data::disassociate(VkDevice dev)
 template <typename dispatchable_type>
 static device_private_data &get_device_private_data(dispatchable_type dispatchable_object)
 {
-   scoped_mutex lock(g_data_lock);
+   std::unique_lock<std::shared_mutex> lock(g_data_lock);
 
    void* device_handle = static_cast<void*>(dispatchable_object);
    void* original_key = nullptr;
@@ -758,7 +761,7 @@ device_private_data &device_private_data::get(VkDevice device)
 
 device_private_data *device_private_data::try_get(VkDevice device)
 {
-   scoped_mutex lock(g_data_lock);
+   std::shared_lock<std::shared_mutex> lock(g_data_lock);
    auto key_it = g_device_key_mapping.find(static_cast<void *>(device));
    void *lookup_key = nullptr;
    if (key_it != g_device_key_mapping.end())
@@ -780,7 +783,7 @@ device_private_data *device_private_data::try_get(VkDevice device)
 
 device_private_data *device_private_data::try_get(VkQueue queue)
 {
-   scoped_mutex lock(g_data_lock);
+   std::shared_lock<std::shared_mutex> lock(g_data_lock);
    auto queue_key_it = g_queue_key_mapping.find(static_cast<void *>(queue));
    if (queue_key_it == g_queue_key_mapping.end())
    {

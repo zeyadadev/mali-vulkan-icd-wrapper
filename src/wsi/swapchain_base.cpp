@@ -476,8 +476,7 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
    image_status_lock.unlock();
 
    /* Try to signal fences/semaphores with a sync FD for optimal performance. */
-   if (m_device_data.disp.get_fn<PFN_vkImportFenceFdKHR>("vkImportFenceFdKHR").has_value() &&
-       m_device_data.disp.get_fn<PFN_vkImportSemaphoreFdKHR>("vkImportSemaphoreFdKHR").has_value())
+   if (m_device_data.supports_sync_fd_signal_import())
    {
       if (fence != VK_NULL_HANDLE)
       {

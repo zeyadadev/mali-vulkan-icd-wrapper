@@ -84,6 +84,40 @@ bool allow_non_fifo_present_mode()
    return env_var_is_enabled(std::getenv("WSI_ALLOW_NON_FIFO_PRESENT_MODE")) ||
           env_var_is_enabled(std::getenv("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX"));
 }
+
+void validate_bridge_plane_sizes_once(x11_image_data &image_data)
+{
+   auto &external_mem = image_data.external_mem;
+   const auto &offsets = external_mem.get_offsets();
+   const auto &strides = external_mem.get_strides();
+   const auto &fds = external_mem.get_buffer_fds();
+
+   for (uint32_t plane = 0; plane < external_mem.get_num_planes(); ++plane)
+   {
+      const int plane_fd = fds[plane];
+      const uint64_t required_size = static_cast<uint64_t>(offsets[plane]) +
+                                     static_cast<uint64_t>(strides[plane]) * image_data.height;
+
+      struct stat fd_stat = {};
+      if (plane_fd < 0 || fstat(plane_fd, &fd_stat) != 0)
+      {
+         WSI_LOG_WARNING("Xwayland bridge: plane[%u] fd=%d stat failed during setup (required_size=%llu): %s", plane,
+                         plane_fd, static_cast<unsigned long long>(required_size), strerror(errno));
+         continue;
+      }
+
+      WSI_LOG_DEBUG("Xwayland bridge: validated plane[%u] fd=%d offset=%u stride=%d height=%u required_size=%llu fd_size=%llu",
+                    plane, plane_fd, offsets[plane], strides[plane], image_data.height,
+                    static_cast<unsigned long long>(required_size),
+                    static_cast<unsigned long long>(fd_stat.st_size));
+      if (required_size > static_cast<uint64_t>(fd_stat.st_size))
+      {
+         WSI_LOG_WARNING("Xwayland bridge: plane[%u] required_size (%llu) exceeds fd_size (%llu) during setup", plane,
+                         static_cast<unsigned long long>(required_size),
+                         static_cast<unsigned long long>(fd_stat.st_size));
+      }
+   }
+}
 } // namespace
 
 static VkResult fill_image_create_info(VkImageCreateInfo &image_create_info,
@@ -268,7 +302,6 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
 
 void swapchain::init_bridge_present_rate_limit()
 {
-   constexpr uint32_t default_bridge_fps = 60;
    constexpr uint32_t max_supported_fps = 240;
 
    bool has_env_override = false;
@@ -284,7 +317,8 @@ void swapchain::init_bridge_present_rate_limit()
 
       if (errno != 0 || end == fps_env || *end != '\0')
       {
-         WSI_LOG_WARNING("Xwayland bridge: invalid XWL_DMABUF_BRIDGE_MAX_FPS='%s', using default pacing.", fps_env);
+         WSI_LOG_WARNING("Xwayland bridge: invalid XWL_DMABUF_BRIDGE_MAX_FPS='%s', leaving timer pacing disabled.",
+                         fps_env);
       }
       else if (parsed > max_supported_fps)
       {
@@ -299,12 +333,10 @@ void swapchain::init_bridge_present_rate_limit()
 
    if (!has_env_override)
    {
-      /*
-       * Bridge mode needs a conservative default cap independent of Vulkan present mode.
-       * IMMEDIATE/MAILBOX can otherwise recycle dmabufs too aggressively when feedback
-       * sync is unavailable, causing visible reuse artifacts.
-       */
-      fps = default_bridge_fps;
+      m_bridge_present_interval_ns = 0;
+      m_bridge_present_rate_limit_initialized = false;
+      WSI_LOG_INFO("Xwayland bridge: timer pacing disabled by default; set XWL_DMABUF_BRIDGE_MAX_FPS to enable a cap.");
+      return;
    }
 
    if (fps == 0)
@@ -574,6 +606,7 @@ VkResult swapchain::allocate_and_bind_swapchain_image(VkImageCreateInfo image_cr
       image_data->width = image_create_info.extent.width;
       image_data->height = image_create_info.extent.height;
       TRY_LOG(allocate_image(m_image_create_info, image_data), "Failed to allocate image");
+      validate_bridge_plane_sizes_once(*image_data);
       image_status_lock.unlock();
 
       TRY_LOG(image_data->external_mem.import_memory_and_bind_swapchain_image(image.image),
@@ -854,31 +887,6 @@ void swapchain::present_image(const pending_present_request &pending_present)
       const auto &offsets = external_mem.get_offsets();
       const auto &strides = external_mem.get_strides();
       const auto &fds = external_mem.get_buffer_fds();
-      for (uint32_t plane = 0; plane < external_mem.get_num_planes(); ++plane)
-      {
-         const int plane_fd = fds[plane];
-         const uint64_t required_size = static_cast<uint64_t>(offsets[plane]) +
-                                        static_cast<uint64_t>(strides[plane]) * image_data->height;
-
-         struct stat fd_stat = {};
-         if (plane_fd < 0 || fstat(plane_fd, &fd_stat) != 0)
-         {
-            WSI_LOG_WARNING("Xwayland bridge: plane[%u] fd=%d stat failed (required_size=%llu): %s", plane, plane_fd,
-                            static_cast<unsigned long long>(required_size), strerror(errno));
-            continue;
-         }
-
-         WSI_LOG_DEBUG("Xwayland bridge: plane[%u] fd=%d offset=%u stride=%d height=%u required_size=%llu fd_size=%llu",
-                       plane, plane_fd, offsets[plane], strides[plane], image_data->height,
-                       static_cast<unsigned long long>(required_size),
-                       static_cast<unsigned long long>(fd_stat.st_size));
-         if (required_size > static_cast<uint64_t>(fd_stat.st_size))
-         {
-            WSI_LOG_WARNING("Xwayland bridge: plane[%u] required_size (%llu) exceeds fd_size (%llu)", plane,
-                            static_cast<unsigned long long>(required_size),
-                            static_cast<unsigned long long>(fd_stat.st_size));
-         }
-      }
 
       const bool bridge_ok =
          m_xwayland_bridge &&
