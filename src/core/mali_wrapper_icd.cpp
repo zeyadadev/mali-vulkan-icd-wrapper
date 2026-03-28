@@ -3138,6 +3138,57 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkQueueSubmit2KHR(
     return mali_queue_submit2(queue, submitCount, reinterpret_cast<const VkSubmitInfo2*>(pSubmits), fence);
 }
 
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetDeviceQueue(
+    VkDevice device,
+    uint32_t queueFamilyIndex,
+    uint32_t queueIndex,
+    VkQueue* pQueue)
+{
+    auto mali_get_device_queue = get_mali_device_proc<PFN_vkGetDeviceQueue>(device, "vkGetDeviceQueue");
+    if (mali_get_device_queue == nullptr) {
+        if (pQueue != nullptr) {
+            *pQueue = VK_NULL_HANDLE;
+        }
+        return;
+    }
+
+    mali_get_device_queue(device, queueFamilyIndex, queueIndex, pQueue);
+
+    if (pQueue != nullptr && *pQueue != VK_NULL_HANDLE) {
+        mali_wrapper::register_queue_key_mapping(device, *pQueue);
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetDeviceQueue2(
+    VkDevice device,
+    const VkDeviceQueueInfo2* pQueueInfo,
+    VkQueue* pQueue)
+{
+    if (pQueue == nullptr) {
+        return;
+    }
+
+    auto mali_get_device_queue2 = get_mali_device_proc<PFN_vkGetDeviceQueue2>(device, "vkGetDeviceQueue2");
+    if (mali_get_device_queue2 != nullptr) {
+        mali_get_device_queue2(device, pQueueInfo, pQueue);
+    } else if (pQueueInfo != nullptr && pQueueInfo->flags == 0) {
+        auto mali_get_device_queue = get_mali_device_proc<PFN_vkGetDeviceQueue>(device, "vkGetDeviceQueue");
+        if (mali_get_device_queue == nullptr) {
+            *pQueue = VK_NULL_HANDLE;
+            return;
+        }
+
+        mali_get_device_queue(device, pQueueInfo->queueFamilyIndex, pQueueInfo->queueIndex, pQueue);
+    } else {
+        *pQueue = VK_NULL_HANDLE;
+        return;
+    }
+
+    if (*pQueue != VK_NULL_HANDLE) {
+        mali_wrapper::register_queue_key_mapping(device, *pQueue);
+    }
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateImage(
     VkDevice device,
     const VkImageCreateInfo* pCreateInfo,
@@ -3215,6 +3266,12 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
     }
     if (strcmp(pName, "vkQueueSubmit") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkQueueSubmit);
+    }
+    if (strcmp(pName, "vkGetDeviceQueue") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetDeviceQueue);
+    }
+    if (strcmp(pName, "vkGetDeviceQueue2") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetDeviceQueue2);
     }
     if (strcmp(pName, "vkQueueSubmit2") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkQueueSubmit2);

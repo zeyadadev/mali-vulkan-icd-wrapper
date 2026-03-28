@@ -740,6 +740,22 @@ static device_private_data &get_device_private_data(dispatchable_type dispatchab
             }
          }
       }
+      else if constexpr (std::is_same_v<dispatchable_type, VkQueue>)
+      {
+         if (g_device_data.size() == 1)
+         {
+            auto recovered = g_device_data.begin();
+            WSI_LOG_WARNING("Recovered queue mapping for %p by using sole tracked device %p",
+                            device_handle,
+                            recovered->second != nullptr ? static_cast<void *>(recovered->second->device) : nullptr);
+            auto mapping_insert = g_queue_key_mapping.try_insert(std::make_pair(device_handle, recovered->first));
+            if (!mapping_insert.has_value())
+            {
+               mapping_insert->first->second = recovered->first;
+            }
+            it = recovered;
+         }
+      }
 
       if (it == g_device_data.end())
       {
