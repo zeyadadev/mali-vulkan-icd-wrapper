@@ -80,7 +80,7 @@ VkResult surface_properties::get_surface_capabilities(VkPhysicalDevice physical_
 {
    /* Image count limits */
    get_surface_capabilities_common(physical_device, surface_capabilities);
-   surface_capabilities->minImageCount = 4;
+   surface_capabilities->minImageCount = 2;
 
    int depth;
    specific_surface->get_size_and_depth(&surface_capabilities->currentExtent.width,

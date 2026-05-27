@@ -101,8 +101,12 @@ public:
     */
    virtual bool is_surface_extension_enabled(const mali_wrapper::instance_private_data &instance_data) = 0;
 
-   /* There is no maximum theoretically speaking however we choose 6 for practicality */
-   static constexpr uint32_t MAX_SWAPCHAIN_IMAGE_COUNT = 6;
+   /*
+    * There is no strict theoretical maximum here. The X11 bridge path needs
+    * enough headroom for multi-present consumers such as frame generation, so
+    * keep a deeper pool than the old 6-image default.
+    */
+   static constexpr uint32_t MAX_SWAPCHAIN_IMAGE_COUNT = 9;
 
    /**
     * @brief Get the scaling and gravity capabilities of the surface.

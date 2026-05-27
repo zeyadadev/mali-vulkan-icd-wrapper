@@ -300,7 +300,7 @@ private:
    std::thread m_present_event_thread;
    std::mutex m_thread_status_lock;
    std::condition_variable m_thread_status_cond;
-   util::ring_buffer<xcb_pixmap_t, 6> m_free_buffer_pool;
+   util::ring_buffer<xcb_pixmap_t, wsi::surface_properties::MAX_SWAPCHAIN_IMAGE_COUNT> m_free_buffer_pool;
 };
 
 } /* namespace x11 */

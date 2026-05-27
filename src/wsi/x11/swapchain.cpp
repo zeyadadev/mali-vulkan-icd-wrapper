@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <system_error>
 #include <thread>
@@ -43,6 +44,7 @@
 #include <dlfcn.h>
 #include <drm_fourcc.h>
 #include <fcntl.h>
+#include <link.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -83,6 +85,54 @@ bool allow_non_fifo_present_mode()
 {
    return env_var_is_enabled(std::getenv("WSI_ALLOW_NON_FIFO_PRESENT_MODE")) ||
           env_var_is_enabled(std::getenv("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX"));
+}
+
+bool is_lsfg_vk_loaded()
+{
+   struct search_context
+   {
+      bool found;
+   } context{ false };
+
+   dl_iterate_phdr(
+      [](struct dl_phdr_info *info, size_t, void *data) {
+         auto *context = static_cast<search_context *>(data);
+         if (info && info->dlpi_name && std::strstr(info->dlpi_name, "liblsfg-vk") != nullptr)
+         {
+            context->found = true;
+            return 1;
+         }
+         return 0;
+      },
+      &context);
+
+   return context.found;
+}
+
+size_t bridge_reserved_free_image_count()
+{
+   const char *reserved_env = std::getenv("XWL_DMABUF_BRIDGE_RESERVED_FREE_IMAGES");
+   if (reserved_env && reserved_env[0] != '\0')
+   {
+      errno = 0;
+      char *end = nullptr;
+      unsigned long parsed = std::strtoul(reserved_env, &end, 10);
+      if (errno == 0 && end != reserved_env && *end == '\0' && parsed > 0)
+      {
+         return static_cast<size_t>(parsed);
+      }
+
+      WSI_LOG_WARNING("Xwayland bridge: invalid XWL_DMABUF_BRIDGE_RESERVED_FREE_IMAGES='%s', using automatic value.",
+                      reserved_env);
+   }
+
+   return is_lsfg_vk_loaded() ? 2u : 1u;
+}
+
+size_t bridge_release_lag_for_image_count(size_t image_count)
+{
+   const size_t reserved_free_images = bridge_reserved_free_image_count();
+   return (image_count > reserved_free_images) ? (image_count - reserved_free_images) : 1u;
 }
 
 void validate_bridge_plane_sizes_once(x11_image_data &image_data)
@@ -150,6 +200,7 @@ swapchain::swapchain(wsi::device_private_data &dev_data, const VkAllocationCallb
    , m_image_creation_parameters({}, m_allocator, {}, {})
    , m_send_sbc(0)
    , m_target_msc(0)
+   , m_present_event_thread_run(false)
    , m_thread_status_lock()
    , m_thread_status_cond()
 {
@@ -158,23 +209,26 @@ swapchain::swapchain(wsi::device_private_data &dev_data, const VkAllocationCallb
 
 swapchain::~swapchain()
 {
+   WSI_LOG_DEBUG("x11::swapchain destructor begin this=%p window=0x%x use_bridge=%s", (void *)this,
+                 static_cast<unsigned>(m_window), m_use_xwayland_bridge ? "true" : "false");
    auto thread_status_lock = std::unique_lock<std::mutex>(m_thread_status_lock);
 
    if (m_present_event_thread_run)
    {
       m_present_event_thread_run = false;
       m_thread_status_cond.notify_all();
-      thread_status_lock.unlock();
-
-      if (m_present_event_thread.joinable())
-      {
-         m_present_event_thread.join();
-      }
-
-      thread_status_lock.lock();
    }
 
+   const bool join_present_event_thread = m_present_event_thread.joinable();
    thread_status_lock.unlock();
+
+   if (join_present_event_thread)
+   {
+      m_present_event_thread.join();
+   }
+
+   thread_status_lock.lock();
+   /* Keep bridge teardown serialized with present_image(), which uses the same lock. */
 
    if (m_use_xwayland_bridge)
    {
@@ -190,8 +244,11 @@ swapchain::~swapchain()
       m_xwayland_bridge->stop_stream(m_window);
    }
 
+   thread_status_lock.unlock();
+
    /* Call the base's teardown */
    teardown();
+   WSI_LOG_DEBUG("x11::swapchain destructor end this=%p", (void *)this);
 }
 
 VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKHR *swapchain_create_info,
@@ -951,7 +1008,7 @@ void swapchain::present_image(const pending_present_request &pending_present)
        * Keep a small in-flight queue so we do not render into a buffer that
        * may still be sampled by the compositor.
        */
-      const size_t release_lag_frames = (m_swapchain_images.size() > 1) ? (m_swapchain_images.size() - 1) : 1u;
+      const size_t release_lag_frames = bridge_release_lag_for_image_count(m_swapchain_images.size());
       if (!m_bridge_release_lag_logged)
       {
          WSI_LOG_INFO("Xwayland bridge: delayed image release enabled (lag=%zu frame%s, swapchain_images=%zu)",
