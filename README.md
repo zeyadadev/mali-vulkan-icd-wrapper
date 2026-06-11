@@ -282,6 +282,9 @@ export MALI_WRAPPER_FAKE_SHADER_CULL_DISTANCE=1
 
 # Or enable only VK_EXT_robustness2 robustBufferAccess2 spoof explicitly
 export MALI_WRAPPER_FAKE_ROBUST_BUFFER_ACCESS_2=1
+
+# Or advertise BCn texture compression for use with a BCn decompression layer
+export MALI_WRAPPER_FAKE_TEXTURE_COMPRESSION_BC=1
 ```
 
 Notes:

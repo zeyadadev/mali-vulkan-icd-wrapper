@@ -8,7 +8,10 @@ INSTALL_32BIT="${MALI_INSTALL_32BIT:-false}"
 REMOVE_CONFLICTING_ICD="${MALI_REMOVE_CONFLICTING_ICD:-true}"
 DOWNLOAD_DIR="${MALI_DOWNLOAD_DIR:-/tmp/mali-wrapper-blobs}"
 MALI_64_DEB_URL="${MALI_64_DEB_URL:-https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-04f8711/libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb}"
-MALI_G29_64_DEB_URL="${MALI_G29_64_DEB_URL:-https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-4b399ed/libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb}"
+MALI_G29_VERSION="${MALI_G29_VERSION:-old}"
+MALI_G29_64_OLD_DEB_URL="${MALI_G29_64_OLD_DEB_URL:-https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-4b399ed/libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb}"
+MALI_G29_64_LATEST_DEB_URL="${MALI_G29_64_LATEST_DEB_URL:-https://github.com/ginkage/libmali-rockchip/releases/download/v1.10-1-8e26151/libmali-valhall-g610-g29p1_1.10-1_arm64.deb}"
+MALI_G29_64_DEB_URL="${MALI_G29_64_DEB_URL:-}"
 MALI_G29_64_EXTRACT_DIR="${MALI_G29_64_EXTRACT_DIR:-/opt/mali-g29p1}"
 MALI_G29_CLEAN_EXTRACT="${MALI_G29_CLEAN_EXTRACT:-true}"
 MALI_32_BLOB_URL="${MALI_32_BLOB_URL:-https://github.com/ginkage/libmali-rockchip/raw/refs/heads/master/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so}"
@@ -70,6 +73,71 @@ prompt_yes_no() {
     done
 }
 
+prompt_choice() {
+    local question="$1"
+    local default_value="$2"
+    shift 2
+    local answer=""
+    local choice=""
+
+    while true; do
+        read -r -p "${question} [${default_value}] " answer
+        answer="${answer,,}"
+
+        if [[ -z "${answer}" ]]; then
+            answer="${default_value,,}"
+        fi
+
+        for choice in "$@"; do
+            if [[ "${answer}" == "${choice}" ]]; then
+                printf '%s\n' "${answer}"
+                return 0
+            fi
+        done
+
+        echo "Please choose one of: $*."
+    done
+}
+
+normalize_g29_version() {
+    MALI_G29_VERSION="${MALI_G29_VERSION,,}"
+    case "${MALI_G29_VERSION}" in
+        old|previous|prev|1.9|v1.9)
+            MALI_G29_VERSION="old"
+            ;;
+        latest|new|1.10|v1.10)
+            MALI_G29_VERSION="latest"
+            ;;
+        *)
+            echo "Invalid MALI_G29_VERSION='${MALI_G29_VERSION}'. Use 'old' or 'latest'." >&2
+            exit 1
+            ;;
+    esac
+}
+
+resolve_g29_deb_url() {
+    if [[ -n "${MALI_G29_64_DEB_URL}" ]]; then
+        if [[ "${MALI_G29_64_DEB_URL}" == "${MALI_G29_64_OLD_DEB_URL}" ]]; then
+            MALI_G29_VERSION="old"
+        elif [[ "${MALI_G29_64_DEB_URL}" == "${MALI_G29_64_LATEST_DEB_URL}" ]]; then
+            MALI_G29_VERSION="latest"
+        else
+            MALI_G29_VERSION="custom"
+        fi
+        return
+    fi
+
+    normalize_g29_version
+    case "${MALI_G29_VERSION}" in
+        old)
+            MALI_G29_64_DEB_URL="${MALI_G29_64_OLD_DEB_URL}"
+            ;;
+        latest)
+            MALI_G29_64_DEB_URL="${MALI_G29_64_LATEST_DEB_URL}"
+            ;;
+    esac
+}
+
 run_as_root() {
     if [[ "${EUID}" -eq 0 ]]; then
         "$@"
@@ -112,6 +180,10 @@ configure_interactive_options_if_requested() {
 
     if prompt_yes_no "Extract 64-bit Mali g29p1 blob (no system install)?" "${EXTRACT_G29_64BIT}"; then
         EXTRACT_G29_64BIT="true"
+        if [[ -z "${MALI_G29_64_DEB_URL}" ]]; then
+            normalize_g29_version
+            MALI_G29_VERSION="$(prompt_choice "Use which 64-bit Mali g29p1 blob? old/latest" "${MALI_G29_VERSION,,}" old latest)"
+        fi
     else
         EXTRACT_G29_64BIT="false"
     fi
@@ -133,6 +205,10 @@ configure_interactive_options_if_requested() {
         exit 1
     fi
 
+    if is_true "${EXTRACT_G29_64BIT}"; then
+        resolve_g29_deb_url
+    fi
+
     echo
     echo "Selected options:"
     echo "  install 64-bit g24 blob  : ${INSTALL_64BIT}"
@@ -140,6 +216,7 @@ configure_interactive_options_if_requested() {
     echo "  install 32-bit blob      : ${INSTALL_32BIT}"
     echo "  remove conflicting files : ${REMOVE_CONFLICTING_ICD}"
     echo "  g24 package URL          : ${MALI_64_DEB_URL}"
+    echo "  g29p1 version            : ${MALI_G29_VERSION}"
     echo "  g29p1 package URL        : ${MALI_G29_64_DEB_URL}"
     echo "  g29p1 extract dir        : ${MALI_G29_64_EXTRACT_DIR}"
     echo "  clean g29p1 extract dir  : ${MALI_G29_CLEAN_EXTRACT}"
@@ -192,6 +269,8 @@ extract_g29_64bit_blob_if_requested() {
         echo "dpkg-deb is required for 64-bit package extraction." >&2
         exit 1
     fi
+
+    resolve_g29_deb_url
 
     local deb_name="${MALI_G29_64_DEB_URL##*/}"
     local deb_path=""
