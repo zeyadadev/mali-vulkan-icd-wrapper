@@ -10,6 +10,7 @@ DOWNLOAD_DIR="${MALI_DOWNLOAD_DIR:-/tmp/mali-wrapper-blobs}"
 MALI_64_DEB_URL="${MALI_64_DEB_URL:-https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-04f8711/libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb}"
 MALI_G29_64_DEB_URL="${MALI_G29_64_DEB_URL:-https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-4b399ed/libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb}"
 MALI_G29_64_EXTRACT_DIR="${MALI_G29_64_EXTRACT_DIR:-/opt/mali-g29p1}"
+MALI_G29_CLEAN_EXTRACT="${MALI_G29_CLEAN_EXTRACT:-true}"
 MALI_32_BLOB_URL="${MALI_32_BLOB_URL:-https://github.com/ginkage/libmali-rockchip/raw/refs/heads/master/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so}"
 MALI_32_TARGET="${MALI_32_TARGET:-/usr/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so}"
 MALI_32_SYMLINK="${MALI_32_SYMLINK:-/usr/lib/arm-linux-gnueabihf/libmali.so}"
@@ -141,6 +142,7 @@ configure_interactive_options_if_requested() {
     echo "  g24 package URL          : ${MALI_64_DEB_URL}"
     echo "  g29p1 package URL        : ${MALI_G29_64_DEB_URL}"
     echo "  g29p1 extract dir        : ${MALI_G29_64_EXTRACT_DIR}"
+    echo "  clean g29p1 extract dir  : ${MALI_G29_CLEAN_EXTRACT}"
     echo "  32-bit blob URL          : ${MALI_32_BLOB_URL}"
     echo "  32-bit target            : ${MALI_32_TARGET}"
     echo "  32-bit symlink           : ${MALI_32_SYMLINK}"
@@ -201,16 +203,48 @@ extract_g29_64bit_blob_if_requested() {
 
     echo "Extracting 64-bit Mali g29p1 package to ${MALI_G29_64_EXTRACT_DIR}"
     run_as_root mkdir -p "${MALI_G29_64_EXTRACT_DIR}"
+    if is_true "${MALI_G29_CLEAN_EXTRACT}"; then
+        if [[ -z "${MALI_G29_64_EXTRACT_DIR}" || "${MALI_G29_64_EXTRACT_DIR}" == "/" ]]; then
+            echo "Refusing to clean unsafe g29p1 extract dir: ${MALI_G29_64_EXTRACT_DIR}" >&2
+            exit 1
+        fi
+        echo "Cleaning stale g29p1 extract contents from ${MALI_G29_64_EXTRACT_DIR}"
+        run_as_root find "${MALI_G29_64_EXTRACT_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    fi
     run_as_root dpkg-deb -x "${deb_path}" "${MALI_G29_64_EXTRACT_DIR}"
 
     local extracted_lib=""
-    extracted_lib="$(find "${MALI_G29_64_EXTRACT_DIR}" -name 'libmali-*.so' -path '*/aarch64-linux-gnu/*' | head -1)"
-    if [[ -n "${extracted_lib}" ]]; then
-        local lib_dir=""
-        lib_dir="$(dirname "${extracted_lib}")"
-        run_as_root ln -sf "${extracted_lib}" "${lib_dir}/libmali.so"
-        run_as_root ln -sf "${extracted_lib}" "${lib_dir}/libmali.so.0"
+    extracted_lib="$(find "${MALI_G29_64_EXTRACT_DIR}" -type f -name 'libmali.so.[0-9]*' -path '*/aarch64-linux-gnu/*' | sort -V | tail -1)"
+    if [[ -z "${extracted_lib}" ]]; then
+        extracted_lib="$(find "${MALI_G29_64_EXTRACT_DIR}" -type f -name 'libmali-valhall*.so' -path '*/aarch64-linux-gnu/*' | sort -V | head -1)"
     fi
+
+    if [[ -z "${extracted_lib}" ]]; then
+        echo "ERROR: no real libmali shared object found after extraction" >&2
+        exit 1
+    fi
+
+    local lib_dir=""
+    lib_dir="$(dirname "${extracted_lib}")"
+
+    echo "Using extracted Mali blob: ${extracted_lib}"
+    echo "Replacing libmali loader aliases with regular files (no symlink chain)"
+    run_as_root rm -f -- "${lib_dir}/libmali.so" "${lib_dir}/libmali.so.0"
+    run_as_root cp -a -- "${extracted_lib}" "${lib_dir}/libmali.so"
+    run_as_root cp -a -- "${extracted_lib}" "${lib_dir}/libmali.so.0"
+
+    local alias_path=""
+    for alias_path in "${lib_dir}/libmali.so.1" "${lib_dir}"/libmali-valhall*.so; do
+        if [[ "${alias_path}" == "${extracted_lib}" ]]; then
+            continue
+        fi
+        if [[ ! -e "${alias_path}" && ! -L "${alias_path}" ]]; then
+            continue
+        fi
+
+        run_as_root rm -f -- "${alias_path}"
+        run_as_root cp -a -- "${extracted_lib}" "${alias_path}"
+    done
 }
 
 install_32bit_blob_if_requested() {
@@ -292,6 +326,7 @@ normalize_bool_var "INSTALL_64BIT"
 normalize_bool_var "EXTRACT_G29_64BIT"
 normalize_bool_var "INSTALL_32BIT"
 normalize_bool_var "REMOVE_CONFLICTING_ICD"
+normalize_bool_var "MALI_G29_CLEAN_EXTRACT"
 configure_interactive_options_if_requested
 
 if ! is_true "${INSTALL_64BIT}" && ! is_true "${EXTRACT_G29_64BIT}" && ! is_true "${INSTALL_32BIT}" && ! is_true "${REMOVE_CONFLICTING_ICD}"; then
