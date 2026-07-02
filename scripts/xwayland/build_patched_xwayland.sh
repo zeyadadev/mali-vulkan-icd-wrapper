@@ -203,6 +203,7 @@ install_build_dependencies_if_requested() {
         mesa-common-dev
         libxcb-xinput-dev
         libxcb-damage0-dev
+        libxcb-present-dev
     )
 
     if is_true "${SECURE_RPC}"; then
@@ -337,6 +338,8 @@ if [[ -d "${BUILD_DIR}" ]]; then
         -Dprefix="${PREFIX_DIR}" \
         -Dbuildtype=debugoptimized \
         -Dsecure-rpc="${SECURE_RPC}" \
+        -Dglamor=true \
+        -Ddri3=true \
         "${MESON_EXTRA_ARGS_ARRAY[@]}"
 else
     meson setup "${BUILD_DIR}" \
@@ -344,6 +347,8 @@ else
         -Dprefix="${PREFIX_DIR}" \
         -Dbuildtype=debugoptimized \
         -Dsecure-rpc="${SECURE_RPC}" \
+        -Dglamor=true \
+        -Ddri3=true \
         "${MESON_EXTRA_ARGS_ARRAY[@]}"
 fi
 

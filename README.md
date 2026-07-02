@@ -52,10 +52,10 @@ wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-04f871
 sudo apt install ./libmali-valhall-g610-g24p0-wayland-gbm_1.9-1_arm64.deb
 
 # 64-bit g29p1 package (extract only for Vulkan apps)
-wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.9-1-4b399ed/libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb
+wget https://github.com/ginkage/libmali-rockchip/releases/download/v1.10-1-04567f4/libmali-valhall-g610-g29p1_1.10-1_arm64.deb
 sudo mkdir -p /opt/mali-g29p1
-sudo dpkg-deb -x libmali-valhall-g610-g29p1-x11-wayland-gbm_1.9-1_arm64.deb /opt/mali-g29p1
-sudo ln -sf /opt/mali-g29p1/usr/lib/aarch64-linux-gnu/libmali-valhall-g610-g29p1-*.so \
+sudo dpkg-deb -x libmali-valhall-g610-g29p1_1.10-1_arm64.deb /opt/mali-g29p1
+sudo ln -sf /opt/mali-g29p1/usr/lib/aarch64-linux-gnu/libmali.so.1.10.0 \
   /opt/mali-g29p1/usr/lib/aarch64-linux-gnu/libmali.so
 
 # 32-bit blob + libmali.so symlink
@@ -229,17 +229,30 @@ file /usr/lib/arm-linux-gnueabihf/libmali_wrapper.so   # 32-bit
 | `ENABLE_WAYLAND_FIFO_PRESENTATION_THREAD` | Use FIFO presentation thread | ON |
 | `SELECT_EXTERNAL_ALLOCATOR` | External memory allocator backend | `dma_buf_heaps` |
 
-### X11 Zero-Copy (Patched Xwayland)
+### X11 Zero-Copy (DRI3 Present + Patched Xwayland)
 
-For X11 apps running under Wayland, the wrapper includes a dmabuf bridge that enables zero-copy presentation through a patched Xwayland. This avoids the default SHM copy path.
+For X11 apps running under Wayland, the preferred path is now DRI3 + Present through a patched Xwayland. The wrapper imports swapchain dma-bufs as X pixmaps with DRI3 and presents them with X11 Present, avoiding the default SHM copy path.
 
 ```bash
 ./scripts/xwayland/build_patched_xwayland.sh
 ```
 
-In interactive mode, the script prompts to install the patched binary to `/usr/bin/Xwayland` and configure the bridge socket environment. Log out and back in after install.
+The patched Xwayland stack carries the Mali dmabuf/glamor fixes required for DRI3 presentation; see Credits for upstream references.
 
-Full setup, runtime options, and rollback guide: [docs/xwayland-dmabuf-bridge.md](docs/xwayland-dmabuf-bridge.md)
+Runtime selection order:
+- `WSI_X11_FORCE_SHM=1`: force the SHM copy fallback.
+- `WSI_X11_FORCE_BRIDGE=1` plus `XWL_DMABUF_BRIDGE`: force the legacy private bridge path.
+- DRI3 + Present available: use the DRI3 zero-copy path.
+- `XWL_DMABUF_BRIDGE` available: use the legacy bridge fallback.
+- Otherwise: use SHM.
+
+The old `XWL_DMABUF_BRIDGE` path is kept only as a legacy fallback/debug path while the DRI3 path gets more runtime coverage. It is no longer the normal zero-copy implementation, and it should not be needed on a fully patched Xwayland.
+
+Useful DRI3 toggles:
+- `WSI_X11_DRI3_COPY=1`: request `XCB_PRESENT_OPTION_COPY` instead of the default zero-copy Present path.
+- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep requested MAILBOX/IMMEDIATE modes instead of forcing FIFO for dmabuf presentation.
+
+Full legacy bridge setup, runtime options, and rollback guide: [docs/xwayland-dmabuf-bridge.md](docs/xwayland-dmabuf-bridge.md)
 
 ## Debugging
 
@@ -318,4 +331,4 @@ No configuration files, no runtime detection, no architecture mismatches.
 
 ## Credits
 
-This wrapper integrates the [Vulkan WSI Layer](https://github.com/ginkage/vulkan-wsi-layer) by [ginkage](https://github.com/ginkage) to provide Window System Integration functionality. The WSI layer handles surface creation, swapchain management, and presentation for Wayland, X11, and headless rendering.
+This wrapper integrates GinKage's [Vulkan WSI Layer](https://github.com/ginkage/vulkan-wsi-layer) for Wayland, X11, and headless WSI support. Special thanks to [GinKage](https://github.com/ginkage) for the X11 DRI3 + Present work, patched [xserver/Xwayland](https://github.com/ginkage/xserver) Mali fixes, and [libmali-rockchip](https://github.com/ginkage/libmali-rockchip) packaging work that this wrapper's current X11 zero-copy path builds on.

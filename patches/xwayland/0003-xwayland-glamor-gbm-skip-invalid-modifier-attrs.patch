@@ -1,0 +1,42 @@
+From 1068157659e456132d8267c741108e738baa5494 Mon Sep 17 00:00:00 2001
+From: Robin Wang <robin.wang@cixtech.com>
+Date: Fri, 24 Nov 2023 19:49:46 +0800
+Subject: [PATCH] CIX: Fix dri3_pixmap_from_buffer fail on Mali in glamor
+ Xwayland
+
+Cherry-picked from CIX xserver commit 99c2ebdb4. Mali reports
+DRM_FORMAT_MOD_INVALID for its buffers; passing explicit modifier attributes to
+eglCreateImageKHR in that case makes the DRI3 pixmap import fail. Only add the
+modifier attributes when the modifier is valid.
+
+Signed-off-by: Robin Wang <robin.wang@cixtech.com>
+---
+ hw/xwayland/xwayland-glamor-gbm.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/hw/xwayland/xwayland-glamor-gbm.c b/hw/xwayland/xwayland-glamor-gbm.c
+index 5abd43b..8f11d29 100644
+--- a/hw/xwayland/xwayland-glamor-gbm.c
++++ b/hw/xwayland/xwayland-glamor-gbm.c
+@@ -241,10 +241,14 @@ xwl_glamor_gbm_create_pixmap_for_bo(ScreenPtr screen, struct gbm_bo *bo,
+             ADD_ATTR(img_attrs, attr_num, gbm_bo_get_offset(bo, plane));
+             ADD_ATTR(img_attrs, attr_num, planeAttrs[plane][PLANE_PITCH]);
+             ADD_ATTR(img_attrs, attr_num, gbm_bo_get_stride_for_plane(bo, plane));
+-            ADD_ATTR(img_attrs, attr_num, planeAttrs[plane][PLANE_MODIFIER_LO]);
+-            ADD_ATTR(img_attrs, attr_num, (uint32_t)(modifier & 0xFFFFFFFFULL));
+-            ADD_ATTR(img_attrs, attr_num, planeAttrs[plane][PLANE_MODIFIER_HI]);
+-            ADD_ATTR(img_attrs, attr_num, (uint32_t)(modifier >> 32ULL));
++            /* Mali reports DRM_FORMAT_MOD_INVALID; passing modifier attrs in
++             * that case makes eglCreateImageKHR (DRI3 import) fail. */
++            if (modifier != DRM_FORMAT_MOD_INVALID) {
++                ADD_ATTR(img_attrs, attr_num, planeAttrs[plane][PLANE_MODIFIER_LO]);
++                ADD_ATTR(img_attrs, attr_num, (uint32_t)(modifier & 0xFFFFFFFFULL));
++                ADD_ATTR(img_attrs, attr_num, planeAttrs[plane][PLANE_MODIFIER_HI]);
++                ADD_ATTR(img_attrs, attr_num, (uint32_t)(modifier >> 32ULL));
++            }
+         }
+         ADD_ATTR(img_attrs, attr_num, EGL_NONE);
+ #undef ADD_ATTR
+-- 
+2.43.0
+

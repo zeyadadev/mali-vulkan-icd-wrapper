@@ -115,6 +115,7 @@ uint32_t drm_fourcc_format_get_num_planes(uint32_t format)
    case DRM_FORMAT_ABGR8888:
    case DRM_FORMAT_RGBA8888:
    case DRM_FORMAT_BGRA8888:
+   case DRM_FORMAT_ARGB2101010:
    case DRM_FORMAT_ABGR2101010:
       return 1;
    }

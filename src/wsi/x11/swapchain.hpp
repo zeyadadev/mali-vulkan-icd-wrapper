@@ -62,6 +62,7 @@ namespace wsi
 namespace x11
 {
 class xwayland_dmabuf_bridge_client;
+class dri3_presenter;
 
 struct pending_completion
 {
@@ -97,6 +98,8 @@ struct x11_image_data
    uint32_t height = 0;
    uint32_t stride = 0;
    int depth = 0;
+   uint8_t bpp = 0;
+   uint64_t modifier = 0;
 
    void *cpu_buffer = nullptr;
    size_t cpu_buffer_size = 0;
@@ -261,7 +264,9 @@ private:
     * @brief Presentation strategy for this swapchain.
     */
    std::unique_ptr<shm_presenter> m_shm_presenter;
+   std::unique_ptr<dri3_presenter> m_dri3_presenter;
    std::unique_ptr<xwayland_dmabuf_bridge_client> m_xwayland_bridge;
+   bool m_use_dri3_presenter = false;
    bool m_use_xwayland_bridge = false;
    uint64_t m_bridge_present_interval_ns = 0;
    std::chrono::steady_clock::time_point m_bridge_next_present_time{};
@@ -292,6 +297,7 @@ private:
 
    uint64_t m_send_sbc;
    uint64_t m_target_msc;
+   uint64_t m_last_present_msc = 0;
 
    VkPhysicalDeviceMemoryProperties2 m_memory_props;
 

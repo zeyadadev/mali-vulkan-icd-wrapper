@@ -1,0 +1,31 @@
+From 9f9a6636f676971b7a0cc2c62c927f2d98c946f7 Mon Sep 17 00:00:00 2001
+From: Kai Guo <Kai.Guo@cixtech.com>
+Date: Mon, 25 Nov 2024 11:28:07 +0800
+Subject: [PATCH] CIX: Add 4-bit alpha format support
+
+Cherry-picked from CIX xserver commit 7449c26e3. Add a depth-4 PICT_a4 entry to
+the default picture formats, which Mali needs for 4-bit alpha pixmaps.
+
+Signed-off-by: Kai Guo <Kai.Guo@cixtech.com>
+---
+ render/picture.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/render/picture.c b/render/picture.c
+index 2be4b19..3fa48f9 100644
+--- a/render/picture.c
++++ b/render/picture.c
+@@ -188,6 +188,10 @@ PictureCreateDefaultFormats(ScreenPtr pScreen, int *nformatp)
+                                            PICT_TYPE_A, 8, 0, 0, 0);
+     formats[nformats].depth = 8;
+     nformats++;
++    formats[nformats].format = PICT_FORMAT(BitsPerPixel(4),
++                                           PICT_TYPE_A, 4, 0, 0, 0);
++    formats[nformats].depth = 4;
++    nformats++;
+     formats[nformats].format = PICT_a8r8g8b8;
+     formats[nformats].depth = 32;
+     nformats++;
+-- 
+2.43.0
+

@@ -47,7 +47,7 @@ pkg_check_modules(LIBDRM REQUIRED libdrm)
 find_package(X11 REQUIRED)
 
 # Find XCB
-pkg_check_modules(XCB REQUIRED xcb xcb-dri3 xcb-shm xcb-sync)
+pkg_check_modules(XCB REQUIRED xcb xcb-dri3 xcb-present xcb-shm xcb-sync)
 
 # Find Xrandr for X11
 find_library(XRANDR_LIBRARY Xrandr REQUIRED)
@@ -106,6 +106,7 @@ set(WSI_X11_SOURCES
     src/wsi/x11/surface_properties.cpp
     src/wsi/x11/swapchain.cpp
     src/wsi/x11/shm_presenter.cpp
+    src/wsi/x11/dri3_presenter.cpp
     src/wsi/x11/drm_display.cpp
     src/wsi/x11/xwayland_dmabuf_bridge.cpp
 )
@@ -233,6 +234,7 @@ set(COMMON_LIBRARIES
     ${XCB_LIBRARIES}
     X11-xcb
     xcb-dri3
+    xcb-present
     xcb-shm
     xcb-sync
     drm

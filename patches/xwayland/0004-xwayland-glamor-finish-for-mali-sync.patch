@@ -1,0 +1,84 @@
+From a5a2f0d0e0d0a80f987a5e89b5638c5c9fc5ccd8 Mon Sep 17 00:00:00 2001
+From: Kai Guo <Kai.Guo@cixtech.com>
+Date: Mon, 19 Aug 2024 18:11:13 +0800
+Subject: [PATCH] CIX: Make sure all GL commands complete in
+ glamor_block_handler
+
+Cherry-picked from CIX xserver commit 5db4c4d8f. The arm/Mali (and NVIDIA) EGL
+stacks have no implicit synchronization, so a glamor-rendered buffer must be
+fully complete - not merely flushed - before it is handed to the Wayland
+compositor, otherwise the compositor may sample a half-rendered frame.
+
+Default to glamor_finish() in the block handlers; set XWAYLAND_LITE_SYNC to keep
+the lighter glamor_flush() and instead finish per-damage in
+xwl_window_post_damage (the NVIDIA path).
+
+Signed-off-by: Kai Guo <Kai.Guo@cixtech.com>
+---
+ glamor/glamor.c               | 14 ++++++++++++--
+ hw/xwayland/xwayland-window.c | 10 ++++++++++
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/glamor/glamor.c b/glamor/glamor.c
+index 848b484..c5cdad5 100644
+--- a/glamor/glamor.c
++++ b/glamor/glamor.c
+@@ -271,7 +271,14 @@ void
+ glamor_block_handler(ScreenPtr screen)
+ {
+     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+-    glamor_flush(glamor_priv);
++
++    /* Without implicit sync (arm/Mali, NVIDIA) the buffer must be fully rendered
++     * before the compositor samples it; glFlush is not enough. XWAYLAND_LITE_SYNC
++     * opts back into the lighter flush (and moves the finish to post_damage). */
++    if (getenv("XWAYLAND_LITE_SYNC"))
++        glamor_flush(glamor_priv);
++    else
++        glamor_finish(screen);
+ }
+ 
+ static void
+@@ -279,7 +286,10 @@ _glamor_block_handler(ScreenPtr screen, void *timeout)
+ {
+     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+ 
+-    glamor_flush(glamor_priv);
++    if (getenv("XWAYLAND_LITE_SYNC"))
++        glamor_flush(glamor_priv);
++    else
++        glamor_finish(screen);
+ 
+     screen->BlockHandler = glamor_priv->saved_procs.block_handler;
+     screen->BlockHandler(screen, timeout);
+diff --git a/hw/xwayland/xwayland-window.c b/hw/xwayland/xwayland-window.c
+index 4978f37..d014996 100644
+--- a/hw/xwayland/xwayland-window.c
++++ b/hw/xwayland/xwayland-window.c
+@@ -51,6 +51,10 @@
+ #include "xdg-shell-client-protocol.h"
+ #include "xwayland-shell-v1-client-protocol.h"
+ 
++#ifdef XWL_HAS_GLAMOR
++#include "glamor.h"
++#endif
++
+ #define DELAYED_WL_SURFACE_DESTROY 1000 /* ms */
+ 
+ #define MAX_ROOTFUL_WIDTH 32767
+@@ -1403,6 +1407,12 @@ xwl_window_attach_buffer(struct xwl_window *xwl_window)
+ 
+ #ifdef XWL_HAS_GLAMOR
+     if (xwl_screen->glamor) {
++        /* XWAYLAND_LITE_SYNC follows the NVIDIA path: with implicit sync absent on
++         * arm/Mali, finish per-damage here instead of globally in the block
++         * handler (see glamor_block_handler). */
++        if (getenv("XWAYLAND_LITE_SYNC"))
++            glamor_finish(xwl_screen->screen);
++
+         if (!xwl_glamor_post_damage(xwl_window, pixmap, region)) {
+             ErrorF("glamor: Failed to post damage\n");
+             return FALSE;
+-- 
+2.43.0
+
