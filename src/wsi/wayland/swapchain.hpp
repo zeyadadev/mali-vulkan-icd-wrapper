@@ -217,6 +217,8 @@ private:
     */
    struct image_creation_parameters m_image_creation_parameters;
 
+   bool m_has_alpha = false;
+
    /**
     * @brief Finds what formats are compatible with the requested swapchain image Vulkan Device and Wayland surface.
     *

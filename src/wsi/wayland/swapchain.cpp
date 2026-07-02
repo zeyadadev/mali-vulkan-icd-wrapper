@@ -135,7 +135,6 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
                                   bool &use_presentation_thread)
 {
    UNUSED(device);
-   UNUSED(swapchain_create_info);
    UNUSED(use_presentation_thread);
 
    if ((m_display == nullptr) || (m_surface == nullptr) || (m_wsi_surface->get_dmabuf_interface() == nullptr))
@@ -164,6 +163,8 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
     */
    use_presentation_thread =
       WAYLAND_FIFO_PRESENTATION_THREAD_ENABLED && (m_present_mode != VK_PRESENT_MODE_MAILBOX_KHR);
+
+   m_has_alpha = swapchain_create_info->compositeAlpha == VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
 
    return VK_SUCCESS;
 }
@@ -439,8 +440,11 @@ VkResult swapchain::create_wl_buffer(const VkImageCreateInfo &image_create_info,
    auto fourcc = util::drm::vk_to_drm_format(image_create_info.format);
    assert(image_create_info.extent.width <= INT32_MAX);
    assert(image_create_info.extent.height <= INT32_MAX);
-   if (fourcc == DRM_FORMAT_ARGB8888) fourcc = DRM_FORMAT_XRGB8888;
-   if (fourcc == DRM_FORMAT_ABGR8888) fourcc = DRM_FORMAT_XBGR8888;
+   if (!m_has_alpha)
+   {
+      if (fourcc == DRM_FORMAT_ARGB8888) fourcc = DRM_FORMAT_XRGB8888;
+      if (fourcc == DRM_FORMAT_ABGR8888) fourcc = DRM_FORMAT_XBGR8888;
+   }
    image_data->buffer = zwp_linux_buffer_params_v1_create_immed(params, image_create_info.extent.width,
                                                                 image_create_info.extent.height, fourcc, 0);
    zwp_linux_buffer_params_v1_destroy(params);

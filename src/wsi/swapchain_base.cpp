@@ -540,7 +540,7 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
    };
    TRY(sync_queue_submit(m_device_data, m_queue, fence, semaphores));
 
-   return VK_SUCCESS;
+   return success_or_suboptimal();
 }
 
 VkResult swapchain_base::get_swapchain_images(uint32_t *swapchain_image_count, VkImage *swapchain_images)
@@ -704,7 +704,7 @@ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *pr
 
    TRY(notify_presentation_engine(submit_info.pending_present));
 
-   return VK_SUCCESS;
+   return success_or_suboptimal();
 }
 
 void swapchain_base::deprecate(VkSwapchainKHR descendant)

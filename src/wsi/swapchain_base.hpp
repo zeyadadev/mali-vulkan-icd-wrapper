@@ -592,12 +592,17 @@ protected:
     */
    bool error_has_occured() const
    {
-      return m_error_state != VK_SUCCESS;
+      return m_error_state != VK_SUCCESS && m_error_state != VK_SUBOPTIMAL_KHR;
    }
 
    VkResult get_error_state() const
    {
       return m_error_state;
+   }
+
+   VkResult success_or_suboptimal() const
+   {
+      return m_error_state == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
    }
 
    /*

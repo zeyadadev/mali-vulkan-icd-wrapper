@@ -33,6 +33,8 @@
 #include "wl_helpers.hpp"
 #include "utils/logging.hpp"
 
+#include <drm_fourcc.h>
+
 namespace wsi
 {
 namespace wayland
@@ -66,6 +68,10 @@ zwp_linux_dmabuf_v1_modifier_impl(void *data, struct zwp_linux_dmabuf_v1 *dma_bu
    drm_format_pair format = {};
    format.fourcc = drm_format;
    format.modifier = (static_cast<uint64_t>(modifier_hi) << 32) | modifier_low;
+   if (format.modifier == DRM_FORMAT_MOD_INVALID)
+   {
+      format.modifier = DRM_FORMAT_MOD_LINEAR;
+   }
 
    if (!drm_supported_formats->is_out_of_memory)
    {
