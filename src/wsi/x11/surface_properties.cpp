@@ -274,16 +274,11 @@ VWL_VKAPI_CALL(VkBool32)
 GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
                                            xcb_connection_t *connection, xcb_visualid_t visual_id)
 {
+   UNUSED(physicalDevice);
    UNUSED(queueFamilyIndex);
-   bool dev_supports_sync =
-      sync_fd_fence_sync::is_supported(wsi::instance_private_data::get(physicalDevice), physicalDevice);
-   if (!dev_supports_sync)
-   {
-      return VK_FALSE;
-   }
 
    if (!visual_supported(connection_get_visualtype(connection, visual_id)))
-      return false;
+      return VK_FALSE;
 
    return VK_TRUE;
 }

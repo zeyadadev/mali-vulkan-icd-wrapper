@@ -508,13 +508,7 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
 
    const bool requested_non_fifo_mode =
       m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR || m_present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
-   if (m_use_dri3_presenter && requested_non_fifo_mode)
-   {
-      WSI_LOG_WARNING(
-         "X11 DRI3 Present: forcing FIFO present mode for safety; WSI_ALLOW_NON_FIFO_PRESENT_MODE only applies to the legacy bridge path.");
-      m_present_mode = VK_PRESENT_MODE_FIFO_KHR;
-   }
-   else if (m_use_xwayland_bridge && requested_non_fifo_mode && !allow_bridge_non_fifo_present_mode())
+   if (m_use_xwayland_bridge && requested_non_fifo_mode && !allow_bridge_non_fifo_present_mode())
    {
       WSI_LOG_WARNING(
          "Xwayland bridge: forcing FIFO present mode for safety (set WSI_ALLOW_NON_FIFO_PRESENT_MODE=1 to keep requested mode on the legacy bridge path).");

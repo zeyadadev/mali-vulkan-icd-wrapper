@@ -15,6 +15,8 @@
 #include <cinttypes>
 #include <string>
 #include <sstream>
+#include <X11/Xlib.h>
+#include <xcb/xcb.h>
 
 extern "C" {
     VkResult CreateWaylandSurfaceKHR(VkInstance instance, const VkWaylandSurfaceCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface);
@@ -43,6 +45,10 @@ extern "C" {
 
 extern "C" {
     VkBool32 GetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, struct wl_display* display);
+    VkBool32 GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+                                                        xcb_connection_t* connection, xcb_visualid_t visual_id);
+    VkBool32 GetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+                                                         Display* dpy, VisualID visualID);
 }
 
 namespace mali_wrapper {
@@ -621,6 +627,8 @@ bool WSIManager::is_wsi_function(const char* function_name) {
     if (strcmp(function_name, "vkGetPhysicalDeviceSurfaceFormats2KHR") == 0) return true;
     if (strcmp(function_name, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0) return true;
     if (strcmp(function_name, "vkGetPhysicalDeviceWaylandPresentationSupportKHR") == 0) return true;
+    if (strcmp(function_name, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0) return true;
+    if (strcmp(function_name, "vkGetPhysicalDeviceXlibPresentationSupportKHR") == 0) return true;
 
     // Swapchain functions
     if (strcmp(function_name, "vkCreateSwapchainKHR") == 0) return true;
@@ -685,6 +693,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL static_vkGetPhysicalDeviceSurfacePresentMo
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL static_vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, struct wl_display* display) {
     return GetWSIManager().get_wayland_presentation_support(physicalDevice, queueFamilyIndex, display);
+}
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL static_vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, xcb_connection_t* connection, xcb_visualid_t visual_id) {
+    return GetPhysicalDeviceXcbPresentationSupportKHR(physicalDevice, queueFamilyIndex, connection, visual_id);
+}
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL static_vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, Display* dpy, VisualID visualID) {
+    return GetPhysicalDeviceXlibPresentationSupportKHR(physicalDevice, queueFamilyIndex, dpy, visualID);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL static_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain) {
@@ -758,6 +774,12 @@ PFN_vkVoidFunction WSIManager::get_function_pointer(const char* function_name) {
     }
     if (strcmp(function_name, "vkGetPhysicalDeviceWaylandPresentationSupportKHR") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(static_vkGetPhysicalDeviceWaylandPresentationSupportKHR);
+    }
+    if (strcmp(function_name, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(static_vkGetPhysicalDeviceXcbPresentationSupportKHR);
+    }
+    if (strcmp(function_name, "vkGetPhysicalDeviceXlibPresentationSupportKHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(static_vkGetPhysicalDeviceXlibPresentationSupportKHR);
     }
 
     // Swapchain functions

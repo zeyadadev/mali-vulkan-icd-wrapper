@@ -152,7 +152,7 @@ Runtime behavior:
 - `XWL_DMABUF_BRIDGE_MAX_FPS=<N>`: cap bridge present rate (`0` disables timer pacing, and timer pacing is disabled by default unless this override is set).
 - `XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK=1`: block on per-frame bridge ACK feedback after probing server support. This is now opt-in; default behavior keeps feedback probing non-blocking.
 - `XWL_DMABUF_BRIDGE_FEEDBACK_TIMEOUT_MS=<N>`: timeout for blocking ACK-based frame feedback (default `250` ms) when `XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK=1`.
-- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep the app-selected present mode (MAILBOX/IMMEDIATE/etc.) when the legacy bridge path is selected. The DRI3 Present path still forces FIFO.
+- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep the app-selected present mode (MAILBOX/IMMEDIATE/etc.) when the legacy bridge path is selected. The DRI3 Present path keeps the requested mode without this bridge-only override.
 - `XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1`: legacy alias for bridge-specific setups (deprecated; prefer `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`).
 - `XWL_DMABUF_BRIDGE` unset: use existing SHM presenter path.
 - `WSI_FORCE_SDL_WAYLAND=1`: force legacy SDL workaround path (for fallback testing only).
