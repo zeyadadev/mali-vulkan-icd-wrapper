@@ -147,12 +147,12 @@ Implemented in this repo:
 
 Runtime behavior:
 
-- `XWL_DMABUF_BRIDGE` set: use Xwayland dmabuf bridge path for X11 swapchains.
+- `WSI_X11_FORCE_BRIDGE=1` plus `XWL_DMABUF_BRIDGE` set: force the Xwayland dmabuf bridge path for X11 swapchains.
 - `XWL_DMABUF_BRIDGE_PREFER_LINEAR=1`: prefer `DRM_FORMAT_MOD_LINEAR` (default behavior now prefers non-linear modifiers when available).
 - `XWL_DMABUF_BRIDGE_MAX_FPS=<N>`: cap bridge present rate (`0` disables timer pacing, and timer pacing is disabled by default unless this override is set).
 - `XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK=1`: block on per-frame bridge ACK feedback after probing server support. This is now opt-in; default behavior keeps feedback probing non-blocking.
 - `XWL_DMABUF_BRIDGE_FEEDBACK_TIMEOUT_MS=<N>`: timeout for blocking ACK-based frame feedback (default `250` ms) when `XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK=1`.
-- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep the app-selected present mode (MAILBOX/IMMEDIATE/etc.) for layer-owned X11 and Wayland swapchains (default behavior forces FIFO for compatibility).
+- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep the app-selected present mode (MAILBOX/IMMEDIATE/etc.) when the legacy bridge path is selected. The DRI3 Present path still forces FIFO.
 - `XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1`: legacy alias for bridge-specific setups (deprecated; prefer `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`).
 - `XWL_DMABUF_BRIDGE` unset: use existing SHM presenter path.
 - `WSI_FORCE_SDL_WAYLAND=1`: force legacy SDL workaround path (for fallback testing only).

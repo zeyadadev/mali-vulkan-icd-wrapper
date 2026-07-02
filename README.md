@@ -248,9 +248,11 @@ Runtime selection order:
 
 The old `XWL_DMABUF_BRIDGE` path is kept only as a legacy fallback/debug path while the DRI3 path gets more runtime coverage. It is no longer the normal zero-copy implementation, and it should not be needed on a fully patched Xwayland.
 
-Useful DRI3 toggles:
+Useful DRI3 toggle:
 - `WSI_X11_DRI3_COPY=1`: request `XCB_PRESENT_OPTION_COPY` instead of the default zero-copy Present path.
-- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep requested MAILBOX/IMMEDIATE modes instead of forcing FIFO for dmabuf presentation.
+
+Legacy bridge-only toggle:
+- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep requested MAILBOX/IMMEDIATE modes instead of forcing FIFO when the legacy bridge path is selected.
 
 Full legacy bridge setup, runtime options, and rollback guide: [docs/xwayland-dmabuf-bridge.md](docs/xwayland-dmabuf-bridge.md)
 
