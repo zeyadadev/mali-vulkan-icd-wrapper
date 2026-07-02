@@ -300,8 +300,6 @@ export MALI_WRAPPER_FAKE_SHADER_CULL_DISTANCE=1
 # Or enable only VK_EXT_robustness2 robustBufferAccess2 spoof explicitly
 export MALI_WRAPPER_FAKE_ROBUST_BUFFER_ACCESS_2=1
 
-# Or advertise BCn texture compression for use with a BCn decompression layer
-export MALI_WRAPPER_FAKE_TEXTURE_COMPRESSION_BC=1
 ```
 
 Notes:
@@ -309,6 +307,7 @@ Notes:
 - If a game actually relies on spoofed features, behavior may still be incorrect.
 
 Additional compatibility toggles:
+- `MALI_WRAPPER_HIDE_TEXTURE_COMPRESSION_BC=1`: hide `textureCompressionBC` from feature queries and mask it off before `vkCreateDevice`. BCn is otherwise passed through from the Mali driver by default.
 - `MALI_WRAPPER_FILTER_EXTERNAL_MEMORY_HOST=1`: hide `VK_EXT_external_memory_host` from device extension enumeration and remove it from `vkCreateDevice` extension lists.
 - `MALI_WRAPPER_LOW_ADDRESS_MAP=1`: enable low-address mapping support for `vkMapMemory`/`vkMapMemory2` so returned pointers stay 32-bit compatible. With the patched bifrost kernel, the wrapper uses a zero-copy alias mapping first; otherwise it falls back to the older shadow-copy path.
 - `MALI_WRAPPER_LOW_ADDRESS_MAP_DEBUG=1`: emit live progress lines during gameplay plus a shutdown summary showing which path was used (`normal`, `alias`, or `shadow`) and how often fallback/copy work happened.

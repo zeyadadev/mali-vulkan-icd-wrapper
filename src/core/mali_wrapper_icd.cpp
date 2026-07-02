@@ -751,7 +751,7 @@ struct DxvkFeatureSpoofConfig {
     bool shader_clip_distance = false;
     bool shader_cull_distance = false;
     bool robust_buffer_access_2 = false;
-    bool texture_compression_bc = false;
+    bool hide_texture_compression_bc = false;
 };
 
 static const DxvkFeatureSpoofConfig& get_dxvk_feature_spoof_config()
@@ -798,14 +798,14 @@ static const DxvkFeatureSpoofConfig& get_dxvk_feature_spoof_config()
             is_bool_env_enabled("MALI_WRAPPER_FAKE_ROBUST_BUFFER_ACCESS_2", cached.robust_buffer_access_2);
     }
 
-    if (getenv("MALI_WRAPPER_FAKE_TEXTURE_COMPRESSION_BC") != nullptr) {
-        cached.texture_compression_bc =
-            is_bool_env_enabled("MALI_WRAPPER_FAKE_TEXTURE_COMPRESSION_BC", cached.texture_compression_bc);
+    if (getenv("MALI_WRAPPER_HIDE_TEXTURE_COMPRESSION_BC") != nullptr) {
+        cached.hide_texture_compression_bc =
+            is_bool_env_enabled("MALI_WRAPPER_HIDE_TEXTURE_COMPRESSION_BC", cached.hide_texture_compression_bc);
     }
 
     if (cached.fill_mode_non_solid || cached.multi_viewport ||
         cached.shader_clip_distance || cached.shader_cull_distance ||
-        cached.robust_buffer_access_2 || cached.texture_compression_bc) {
+        cached.robust_buffer_access_2) {
         std::string features;
         if (cached.fill_mode_non_solid) {
             features += "fillModeNonSolid";
@@ -834,14 +834,11 @@ static const DxvkFeatureSpoofConfig& get_dxvk_feature_spoof_config()
             }
             features += "robustBufferAccess2";
         }
-        if (cached.texture_compression_bc) {
-            if (!features.empty()) {
-                features += ", ";
-            }
-            features += "textureCompressionBC";
-        }
 
         LOG_WARN("DXVK feature spoof enabled: advertising " + features);
+    }
+    if (cached.hide_texture_compression_bc) {
+        LOG_WARN("Feature override enabled: hiding textureCompressionBC");
     }
 
     initialized = true;
@@ -853,7 +850,7 @@ static bool is_any_dxvk_feature_spoof_enabled()
     const auto& config = get_dxvk_feature_spoof_config();
     return config.fill_mode_non_solid || config.multi_viewport ||
            config.shader_clip_distance || config.shader_cull_distance ||
-           config.robust_buffer_access_2 || config.texture_compression_bc;
+           config.robust_buffer_access_2 || config.hide_texture_compression_bc;
 }
 
 static void advertise_spoofed_physical_features(VkPhysicalDeviceFeatures* features)
@@ -875,8 +872,8 @@ static void advertise_spoofed_physical_features(VkPhysicalDeviceFeatures* featur
     if (config.shader_cull_distance) {
         features->shaderCullDistance = VK_TRUE;
     }
-    if (config.texture_compression_bc) {
-        features->textureCompressionBC = VK_TRUE;
+    if (config.hide_texture_compression_bc) {
+        features->textureCompressionBC = VK_FALSE;
     }
 }
 
@@ -918,7 +915,7 @@ static void sanitize_requested_physical_features_for_driver(VkPhysicalDeviceFeat
     if (config.shader_cull_distance) {
         features->shaderCullDistance = VK_FALSE;
     }
-    if (config.texture_compression_bc) {
+    if (config.hide_texture_compression_bc) {
         features->textureCompressionBC = VK_FALSE;
     }
 }
