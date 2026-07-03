@@ -251,10 +251,10 @@ The old `XWL_DMABUF_BRIDGE` path is kept only as a legacy fallback/debug path wh
 Useful DRI3 toggle:
 - `WSI_X11_DRI3_COPY=1`: request `XCB_PRESENT_OPTION_COPY` instead of the default zero-copy Present path.
 
-The DRI3 path keeps the app-requested X11 present mode. FIFO uses Present MSC pacing; MAILBOX presents without that FIFO target.
+The DRI3 path currently forces non-FIFO X11 present modes back to FIFO by default for stability on patched Xwayland/Mali. FIFO uses Present MSC pacing.
 
-Legacy bridge-only toggle:
-- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep requested MAILBOX/IMMEDIATE modes instead of forcing FIFO when the legacy bridge path is selected.
+Non-FIFO opt-in:
+- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep requested MAILBOX/IMMEDIATE modes instead of forcing FIFO on X11 dmabuf presentation paths. This may flicker on patched Xwayland/Mali.
 
 Full legacy bridge setup, runtime options, and rollback guide: [docs/xwayland-dmabuf-bridge.md](docs/xwayland-dmabuf-bridge.md)
 

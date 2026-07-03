@@ -87,13 +87,13 @@ bool env_var_is_enabled(const char *value)
    return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 }
 
-bool allow_bridge_non_fifo_present_mode()
+bool allow_x11_non_fifo_present_mode()
 {
-   if (env_var_is_enabled(std::getenv("WSI_ALLOW_NON_FIFO_PRESENT_MODE")))
-   {
-      return true;
-   }
+   return env_var_is_enabled(std::getenv("WSI_ALLOW_NON_FIFO_PRESENT_MODE"));
+}
 
+bool allow_legacy_bridge_non_fifo_present_mode()
+{
    if (env_var_is_enabled(std::getenv("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX")))
    {
       static std::atomic<bool> warned_legacy_mailbox_env{ false };
@@ -508,10 +508,18 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
 
    const bool requested_non_fifo_mode =
       m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR || m_present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
-   if (m_use_xwayland_bridge && requested_non_fifo_mode && !allow_bridge_non_fifo_present_mode())
+   const bool allow_non_fifo_mode = allow_x11_non_fifo_present_mode();
+   if (m_use_dri3_presenter && requested_non_fifo_mode && !allow_non_fifo_mode)
    {
       WSI_LOG_WARNING(
-         "Xwayland bridge: forcing FIFO present mode for safety (set WSI_ALLOW_NON_FIFO_PRESENT_MODE=1 to keep requested mode on the legacy bridge path).");
+         "X11 DRI3 Present: forcing FIFO present mode for stability (set WSI_ALLOW_NON_FIFO_PRESENT_MODE=1 to keep requested mode).");
+      m_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+   }
+   else if (m_use_xwayland_bridge && requested_non_fifo_mode &&
+            !(allow_non_fifo_mode || allow_legacy_bridge_non_fifo_present_mode()))
+   {
+      WSI_LOG_WARNING(
+         "Xwayland bridge: forcing FIFO present mode for safety (set WSI_ALLOW_NON_FIFO_PRESENT_MODE=1 to keep requested mode).");
       m_present_mode = VK_PRESENT_MODE_FIFO_KHR;
    }
 
