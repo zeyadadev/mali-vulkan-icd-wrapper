@@ -128,6 +128,11 @@ bool xwayland_dmabuf_bridge_client::is_enabled() const
    return !m_socket_path.empty();
 }
 
+bool xwayland_dmabuf_bridge_client::is_available()
+{
+   return is_enabled() && ensure_connected();
+}
+
 bool xwayland_dmabuf_bridge_client::is_feedback_sync_enabled() const
 {
    return m_feedback_sync_available && m_feedback_wait_enabled;

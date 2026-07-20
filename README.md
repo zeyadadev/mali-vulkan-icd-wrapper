@@ -246,6 +246,11 @@ Runtime selection order:
 - `XWL_DMABUF_BRIDGE` available: use the legacy bridge fallback.
 - Otherwise: use SHM.
 
+The legacy bridge socket is connected during swapchain creation. If
+`XWL_DMABUF_BRIDGE` points to a missing or unavailable socket, the wrapper
+selects DRI3/SHM immediately instead of returning an out-of-date swapchain on
+the first present.
+
 The old `XWL_DMABUF_BRIDGE` path is kept only as a legacy fallback/debug path while the DRI3 path gets more runtime coverage. It is no longer the normal zero-copy implementation, and it should not be needed on a fully patched Xwayland.
 
 Useful DRI3 toggle:

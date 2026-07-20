@@ -45,6 +45,7 @@ public:
    xwayland_dmabuf_bridge_client &operator=(const xwayland_dmabuf_bridge_client &) = delete;
 
    bool is_enabled() const;
+   bool is_available();
 
    bool present_frame(uint32_t xid, uint32_t width, uint32_t height, uint32_t fourcc, uint64_t modifier,
                       uint32_t num_planes, const uint32_t *offsets, const int *strides, const int *plane_fds);

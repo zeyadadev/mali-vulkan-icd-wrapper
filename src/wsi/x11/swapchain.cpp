@@ -411,9 +411,23 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
    const bool dri3_copy = env_var_is_enabled(std::getenv("WSI_X11_DRI3_COPY"));
 
    m_xwayland_bridge = xwayland_dmabuf_bridge_client::create_from_environment();
-   const bool bridge_requested = (m_xwayland_bridge != nullptr) && m_xwayland_bridge->is_enabled();
+   const bool bridge_configured = (m_xwayland_bridge != nullptr) && m_xwayland_bridge->is_enabled();
+   const bool bridge_requested = bridge_configured && m_xwayland_bridge->is_available();
    const bool bridge_runtime_disabled = g_disable_xwayland_bridge_runtime.load(std::memory_order_acquire);
    const bool bridge_available = bridge_requested && (!bridge_runtime_disabled || force_bridge);
+
+   if (bridge_configured && !bridge_requested)
+   {
+      WSI_LOG_WARNING(
+         "Xwayland bridge is configured but unavailable during swapchain creation; using DRI3/SHM fallback.");
+   }
+
+   WSI_LOG_INFO(
+      "X11 presentation path probe: force_shm=%s force_bridge=%s dri3_copy=%s bridge_configured=%s "
+      "bridge_requested=%s bridge_runtime_disabled=%s bridge_available=%s",
+      force_shm ? "yes" : "no", force_bridge ? "yes" : "no", dri3_copy ? "yes" : "no",
+      bridge_configured ? "yes" : "no", bridge_requested ? "yes" : "no",
+      bridge_runtime_disabled ? "yes" : "no", bridge_available ? "yes" : "no");
 
    auto init_shm_presenter = [&]() -> VkResult {
       try
@@ -505,6 +519,11 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
          }
       }
    }
+
+   const char *selected_path =
+      m_use_dri3_presenter ? "DRI3" : (m_use_xwayland_bridge ? "BRIDGE" : "SHM");
+   WSI_LOG_INFO("X11 presentation path selected=%s window=0x%x", selected_path,
+                static_cast<unsigned>(m_window));
 
    const bool requested_non_fifo_mode =
       m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR || m_present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
