@@ -1,3 +1,4 @@
 /build*/
 .vscode
 third_party/*
+!third_party/JetBrainsMono-OFL.txt

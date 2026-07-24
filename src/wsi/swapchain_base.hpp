@@ -35,6 +35,7 @@
 #include <vulkan/vulkan.h>
 #include <thread>
 #include <array>
+#include <memory>
 
 #include "layer_utils/custom_allocator.hpp"
 #include "layer_utils/helpers.hpp"
@@ -49,6 +50,9 @@
 #include "extensions/frame_boundary.hpp"
 #include "extensions/wsi_extension.hpp"
 #include "layer_utils/macros.hpp"
+#if BUILD_HUD
+#include "hud/hud_renderer.hpp"
+#endif
 
 namespace wsi
 {
@@ -305,6 +309,16 @@ public:
    bool add_swapchain_extension(util::unique_ptr<wsi_ext> extension);
 
 protected:
+   virtual bool is_headless_swapchain() const
+   {
+      return false;
+   }
+
+   virtual const char *display_server_name() const
+   {
+      return "Unknown";
+   }
+
    wsi::device_private_data &m_device_data;
 
    /**
@@ -414,6 +428,10 @@ protected:
     * @brief Image creation info used for all swapchain images.
     */
    VkImageCreateInfo m_image_create_info;
+
+#if BUILD_HUD
+   std::unique_ptr<mali_wrapper::hud::HudSwapchainResources> m_hud;
+#endif
 
    /**
     * @brief Return the VkAllocationCallbacks passed in this object constructor.

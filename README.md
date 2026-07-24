@@ -215,6 +215,65 @@ file /usr/lib/aarch64-linux-gnu/libmali_wrapper.so  # 64-bit
 file /usr/lib/arm-linux-gnueabihf/libmali_wrapper.so   # 32-bit
 ```
 
+### Integrated HUD
+
+The wrapper has a built-in performance HUD. It is disabled by default and does
+not need a Vulkan layer or `LD_PRELOAD`.
+
+```bash
+MALI_HUD=1 vkcube
+```
+
+It shows:
+
+- executable name, graphics API and translation layer
+- resolution and display server
+- FPS and frame time
+- system and process CPU usage
+- system and process RAM usage
+- CPU and GPU temperature
+- GPU load and clock speed
+- Mali driver and wrapper versions
+
+DXVK, VKD3D-Proton and Zink are detected automatically. DXVK client APIs
+(D3D8, D3D9, D3D10 and D3D11) and available translation-layer versions are
+also shown automatically.
+
+Unavailable sensors are displayed as `N/A`. HUD errors do not stop the game;
+the wrapper continues without the overlay.
+
+Runtime controls:
+
+| Variable | Values | Default |
+|----------|--------|---------|
+| `MALI_HUD` | `1` enables the HUD | disabled |
+| `MALI_HUD_POSITION` | `top-left`, `top-right`, `bottom-left`, `bottom-right` | `top-left` |
+| `MALI_HUD_SCALE` | `auto` or `0.75` through `3.0` | `auto` |
+| `MALI_HUD_OPACITY` | background opacity, `0` through `1` | `0.55` |
+| `MALI_HUD_TEXT_OPACITY` | text opacity, `0` through `1` | `0.90` |
+| `MALI_HUD_INTERVAL_MS` | `100` through `5000` | `500` |
+| `MALI_HUD_DEBUG` | `1` enables HUD diagnostics | disabled |
+
+To use a more transparent background:
+
+```bash
+MALI_HUD=1 MALI_HUD_OPACITY=0.40 MALI_HUD_TEXT_OPACITY=0.85 vkcube
+```
+
+Invalid values fall back to their defaults. `auto` scale follows the display
+height. The panel shrinks when needed so it never uses more than half of the
+screen height.
+
+The HUD is included by default. Pass `-DBUILD_HUD=OFF` to CMake to build without
+it. Building with HUD support requires:
+
+```bash
+sudo apt install glslang-tools libstb-dev fonts-jetbrains-mono python3
+```
+
+For HUD fault-injection tests, configure with `-DMALI_HUD_TEST_BUILD=ON` and set
+`MALI_HUD_TEST_FAIL` to `atlas`, `buffer`, `pipeline`, or `sensor`.
+
 ## Configuration Options
 
 | Option | What it does | Default |
@@ -226,6 +285,7 @@ file /usr/lib/arm-linux-gnueabihf/libmali_wrapper.so   # 32-bit
 | `BUILD_WSI_X11` | Enable X11 support | ON |
 | `BUILD_WSI_WAYLAND` | Enable Wayland support | ON |
 | `BUILD_WSI_HEADLESS` | Enable headless rendering | ON |
+| `BUILD_HUD` | Compile the runtime opt-in integrated HUD | ON |
 | `ENABLE_WAYLAND_FIFO_PRESENTATION_THREAD` | Use FIFO presentation thread | ON |
 | `SELECT_EXTERNAL_ALLOCATOR` | External memory allocator backend | `dma_buf_heaps` |
 

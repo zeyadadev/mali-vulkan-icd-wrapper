@@ -91,6 +91,11 @@ public:
    void release_buffer(struct wl_buffer *wl_buffer);
 
 protected:
+   const char *display_server_name() const override
+   {
+      return "Wayland";
+   }
+
    /**
     * @brief Initialize platform specifics.
     */

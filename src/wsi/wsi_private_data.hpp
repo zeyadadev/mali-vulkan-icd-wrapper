@@ -223,6 +223,9 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
    EP(GetInstanceProcAddr, "", VK_API_VERSION_1_0, true)                                                             \
    EP(DestroyInstance, "", VK_API_VERSION_1_0, true)                                                                 \
    EP(GetPhysicalDeviceProperties, "", VK_API_VERSION_1_0, true)                                                     \
+   EP(GetPhysicalDeviceFormatProperties, "", VK_API_VERSION_1_0, false)                                              \
+   EP(GetPhysicalDeviceMemoryProperties, "", VK_API_VERSION_1_0, false)                                              \
+   EP(GetPhysicalDeviceQueueFamilyProperties, "", VK_API_VERSION_1_0, false)                                         \
    EP(GetPhysicalDeviceImageFormatProperties, "", VK_API_VERSION_1_0, true)                                          \
    EP(EnumerateDeviceExtensionProperties, "", VK_API_VERSION_1_0, true)                                              \
    /* VK_KHR_surface */                                                                                              \
@@ -378,6 +381,10 @@ private:
    EP(ResetCommandBuffer, "", VK_API_VERSION_1_0, true)                                                            \
    EP(BeginCommandBuffer, "", VK_API_VERSION_1_0, true)                                                            \
    EP(EndCommandBuffer, "", VK_API_VERSION_1_0, true)                                                              \
+   EP(CreateBuffer, "", VK_API_VERSION_1_0, false)                                                                 \
+   EP(DestroyBuffer, "", VK_API_VERSION_1_0, false)                                                                \
+   EP(GetBufferMemoryRequirements, "", VK_API_VERSION_1_0, false)                                                  \
+   EP(BindBufferMemory, "", VK_API_VERSION_1_0, false)                                                             \
    EP(CreateImage, "", VK_API_VERSION_1_0, true)                                                                   \
    EP(DestroyImage, "", VK_API_VERSION_1_0, true)                                                                  \
    EP(GetImageMemoryRequirements, "", VK_API_VERSION_1_0, true)                                                    \
@@ -386,7 +393,41 @@ private:
    EP(FreeMemory, "", VK_API_VERSION_1_0, true)                                                                    \
    EP(MapMemory, "", VK_API_VERSION_1_0, true)                                                                     \
    EP(UnmapMemory, "", VK_API_VERSION_1_0, true)                                                                   \
+   EP(FlushMappedMemoryRanges, "", VK_API_VERSION_1_0, false)                                                      \
    EP(GetImageSubresourceLayout, "", VK_API_VERSION_1_0, true)                                                     \
+   EP(CreateImageView, "", VK_API_VERSION_1_0, false)                                                              \
+   EP(DestroyImageView, "", VK_API_VERSION_1_0, false)                                                             \
+   EP(CreateSampler, "", VK_API_VERSION_1_0, false)                                                                \
+   EP(DestroySampler, "", VK_API_VERSION_1_0, false)                                                               \
+   EP(CreateDescriptorSetLayout, "", VK_API_VERSION_1_0, false)                                                    \
+   EP(DestroyDescriptorSetLayout, "", VK_API_VERSION_1_0, false)                                                   \
+   EP(CreateDescriptorPool, "", VK_API_VERSION_1_0, false)                                                         \
+   EP(DestroyDescriptorPool, "", VK_API_VERSION_1_0, false)                                                        \
+   EP(AllocateDescriptorSets, "", VK_API_VERSION_1_0, false)                                                       \
+   EP(UpdateDescriptorSets, "", VK_API_VERSION_1_0, false)                                                         \
+   EP(CreateRenderPass, "", VK_API_VERSION_1_0, false)                                                             \
+   EP(DestroyRenderPass, "", VK_API_VERSION_1_0, false)                                                            \
+   EP(CreateFramebuffer, "", VK_API_VERSION_1_0, false)                                                            \
+   EP(DestroyFramebuffer, "", VK_API_VERSION_1_0, false)                                                           \
+   EP(CreateShaderModule, "", VK_API_VERSION_1_0, false)                                                           \
+   EP(DestroyShaderModule, "", VK_API_VERSION_1_0, false)                                                          \
+   EP(CreatePipelineLayout, "", VK_API_VERSION_1_0, false)                                                         \
+   EP(DestroyPipelineLayout, "", VK_API_VERSION_1_0, false)                                                        \
+   EP(CreatePipelineCache, "", VK_API_VERSION_1_0, false)                                                          \
+   EP(DestroyPipelineCache, "", VK_API_VERSION_1_0, false)                                                         \
+   EP(CreateGraphicsPipelines, "", VK_API_VERSION_1_0, false)                                                      \
+   EP(DestroyPipeline, "", VK_API_VERSION_1_0, false)                                                              \
+   EP(CmdPipelineBarrier, "", VK_API_VERSION_1_0, false)                                                           \
+   EP(CmdCopyBufferToImage, "", VK_API_VERSION_1_0, false)                                                         \
+   EP(CmdUpdateBuffer, "", VK_API_VERSION_1_0, false)                                                              \
+   EP(CmdBeginRenderPass, "", VK_API_VERSION_1_0, false)                                                           \
+   EP(CmdEndRenderPass, "", VK_API_VERSION_1_0, false)                                                             \
+   EP(CmdBindPipeline, "", VK_API_VERSION_1_0, false)                                                              \
+   EP(CmdBindDescriptorSets, "", VK_API_VERSION_1_0, false)                                                        \
+   EP(CmdBindVertexBuffers, "", VK_API_VERSION_1_0, false)                                                         \
+   EP(CmdDrawIndirect, "", VK_API_VERSION_1_0, false)                                                              \
+   EP(CmdSetViewport, "", VK_API_VERSION_1_0, false)                                                               \
+   EP(CmdSetScissor, "", VK_API_VERSION_1_0, false)                                                                \
    EP(CreateFence, "", VK_API_VERSION_1_0, true)                                                                   \
    EP(DestroyFence, "", VK_API_VERSION_1_0, true)                                                                  \
    EP(CreateSemaphore, "", VK_API_VERSION_1_0, true)                                                               \

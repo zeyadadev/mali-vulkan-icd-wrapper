@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <system_error>
+#include <vector>
 
 #include <unistd.h>
 #include <vulkan/vulkan.h>
@@ -45,6 +46,10 @@
 #include "layer_utils/helpers.hpp"
 
 #include "swapchain_base.hpp"
+#if BUILD_HUD
+#include "hud/hud_renderer.hpp"
+#include "hud/hud_runtime.hpp"
+#endif
 #include "wsi_factory.hpp"
 
 #include "extensions/present_timing.hpp"
@@ -266,6 +271,12 @@ VkResult swapchain_base::init(VkDevice device, const VkSwapchainCreateInfoKHR *s
       TRY_LOG_CALL(init_page_flip_thread());
    }
 
+   bool hud_candidate = false;
+#if BUILD_HUD
+   hud_candidate = mali_wrapper::hud::HudSwapchainResources::can_attach(
+      m_device_data, *swapchain_create_info, is_headless_swapchain());
+#endif
+
    VkImageCreateInfo image_create_info = {};
    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
    image_create_info.pNext = nullptr;
@@ -278,6 +289,10 @@ VkResult swapchain_base::init(VkDevice device, const VkSwapchainCreateInfoKHR *s
    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
    image_create_info.usage = swapchain_create_info->imageUsage;
+   if (hud_candidate)
+   {
+      image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   }
    image_create_info.flags = 0;
    image_create_info.sharingMode = swapchain_create_info->imageSharingMode;
    image_create_info.queueFamilyIndexCount = swapchain_create_info->queueFamilyIndexCount;
@@ -320,6 +335,31 @@ VkResult swapchain_base::init(VkDevice device, const VkSwapchainCreateInfoKHR *s
    {
       TRY_LOG_CALL(m_device_data.SetDeviceLoaderData(m_device, m_queue));
    }
+
+#if BUILD_HUD
+   if (hud_candidate)
+   {
+      try
+      {
+         std::vector<VkImage> hud_images;
+         hud_images.reserve(m_swapchain_images.size());
+         for (const auto &image : m_swapchain_images)
+         {
+            hud_images.push_back(image.image);
+         }
+         VkSwapchainCreateInfoKHR hud_create_info = *swapchain_create_info;
+         hud_create_info.imageFormat = m_image_create_info.format;
+         m_hud = mali_wrapper::hud::HudSwapchainResources::create(
+            m_device_data, m_queue, hud_create_info, hud_images.data(),
+            static_cast<uint32_t>(hud_images.size()), display_server_name(),
+            get_allocation_callbacks());
+      }
+      catch (...)
+      {
+         m_hud.reset();
+      }
+   }
+#endif
 
    int res = sem_init(&m_start_present_semaphore, 0, 0);
    /* Only programming error can cause this to fail. */
@@ -375,6 +415,10 @@ void swapchain_base::teardown()
       /* Make sure the vkFences are done signaling. */
       m_device_data.disp.QueueWaitIdle(m_queue);
    }
+
+#if BUILD_HUD
+   m_hud.reset();
+#endif
 
    /* We are safe to destroy everything. */
    if (m_thread_sem_defined)
@@ -688,9 +732,21 @@ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *pr
          nullptr,
       (submit_info.present_fence != VK_NULL_HANDLE) ? 1u : 0,
    };
+#if BUILD_HUD
+   VkCommandBuffer hud_command = VK_NULL_HANDLE;
+   if (m_hud)
+   {
+      hud_command = m_hud->prepare(submit_info.pending_present.image_index);
+      if (hud_command != VK_NULL_HANDLE)
+      {
+         semaphores.command_buffers = &hud_command;
+         semaphores.command_buffer_count = 1;
+         semaphores.wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+      }
+   }
+#endif
    TRY_LOG_CALL(image_set_present_payload(m_swapchain_images[submit_info.pending_present.image_index], queue,
                                           semaphores, submission_pnext));
-
    if (submit_info.present_fence != VK_NULL_HANDLE)
    {
       const queue_submit_semaphores wait_semaphores = {

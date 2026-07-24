@@ -19,6 +19,21 @@ endif()
 option(BUILD_32BIT "Build 32-bit wrapper" ${BUILD_32BIT})
 option(BUILD_64BIT "Build 64-bit wrapper" ${BUILD_64BIT})
 option(INSTALL_ICDS "Install ICD manifests" ON)
+option(BUILD_HUD "Build the integrated opt-in Mali HUD" ON)
+option(MALI_HUD_TEST_BUILD "Enable HUD-only fault injection hooks" OFF)
+
+include(CTest)
+
+execute_process(
+    COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE MALI_WRAPPER_GIT_REVISION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT MALI_WRAPPER_GIT_REVISION)
+    set(MALI_WRAPPER_GIT_REVISION "unknown")
+endif()
 
 # WSI configuration options
 option(BUILD_WSI_X11 "Enable X11 WSI support" ON)
@@ -40,6 +55,74 @@ set(API_VERSION "1.3.276" CACHE STRING "Vulkan API version")
 # Find required packages
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(VULKAN REQUIRED vulkan)
+
+if(BUILD_HUD)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    find_program(GLSLANG_VALIDATOR_EXECUTABLE glslangValidator)
+    find_path(STB_INCLUDE_DIR stb/stb_truetype.h)
+    if(NOT GLSLANG_VALIDATOR_EXECUTABLE)
+        message(FATAL_ERROR "BUILD_HUD requires glslangValidator (install glslang-tools)")
+    endif()
+    if(NOT STB_INCLUDE_DIR)
+        message(FATAL_ERROR "BUILD_HUD requires stb/stb_truetype.h (install libstb-dev)")
+    endif()
+    set(HUD_FONT_FILE "" CACHE FILEPATH "JetBrains Mono Regular TTF embedded in the HUD")
+    if(NOT HUD_FONT_FILE)
+        # Search into a separate variable: find_file() skips searching when its
+        # result variable is already cached as an empty string.
+        unset(HUD_FONT_DISCOVERED CACHE)
+        find_file(HUD_FONT_DISCOVERED
+            NAMES JetBrainsMono-Regular.ttf
+            PATHS
+                /usr/share/fonts/truetype/jetbrains-mono
+                /usr/share/fonts/opentype/jetbrains-mono
+                /usr/local/share/fonts
+                $ENV{HOME}/.local/share/fonts
+            NO_DEFAULT_PATH
+        )
+        if(HUD_FONT_DISCOVERED)
+            set(HUD_FONT_FILE "${HUD_FONT_DISCOVERED}" CACHE FILEPATH
+                "JetBrains Mono Regular TTF embedded in the HUD" FORCE)
+        endif()
+    endif()
+    if(NOT HUD_FONT_FILE OR NOT EXISTS "${HUD_FONT_FILE}")
+        message(FATAL_ERROR "BUILD_HUD requires JetBrainsMono-Regular.ttf (install fonts-jetbrains-mono or set HUD_FONT_FILE)")
+    endif()
+
+    set(HUD_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/hud)
+    set(HUD_FONT_HEADER ${HUD_GENERATED_DIR}/hud_font_data.hpp)
+    set(HUD_VERTEX_HEADER ${HUD_GENERATED_DIR}/hud_vert_spv.hpp)
+    set(HUD_FRAGMENT_HEADER ${HUD_GENERATED_DIR}/hud_frag_spv.hpp)
+
+    add_custom_command(
+        OUTPUT ${HUD_FONT_HEADER}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_binary.py
+                ${HUD_FONT_FILE} ${HUD_FONT_HEADER} mali_hud_font_data
+        DEPENDS ${HUD_FONT_FILE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_binary.py
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${HUD_VERTEX_HEADER}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${HUD_GENERATED_DIR}
+        COMMAND ${GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.0
+                --vn mali_hud_vert_spv -o ${HUD_VERTEX_HEADER}
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/hud/shaders/hud.vert
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/hud/shaders/hud.vert
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${HUD_FRAGMENT_HEADER}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${HUD_GENERATED_DIR}
+        COMMAND ${GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.0
+                --vn mali_hud_frag_spv -o ${HUD_FRAGMENT_HEADER}
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/hud/shaders/hud.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/hud/shaders/hud.frag
+        VERBATIM
+    )
+    add_custom_target(hud_generated_files DEPENDS ${HUD_FONT_HEADER} ${HUD_VERTEX_HEADER} ${HUD_FRAGMENT_HEADER})
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/JetBrainsMono-OFL.txt
+        DESTINATION share/doc/mali-wrapper)
+endif()
 
 # WSI dependencies
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
@@ -135,6 +218,17 @@ set(WSI_EXTENSION_SOURCES
     src/wsi/extensions/swapchain_maintenance.cpp
 )
 
+set(HUD_SOURCES)
+if(BUILD_HUD)
+    list(APPEND HUD_SOURCES
+        src/hud/hud_config.cpp
+        src/hud/hud_metadata.cpp
+        src/hud/hud_metrics.cpp
+        src/hud/hud_renderer.cpp
+        src/hud/hud_runtime.cpp
+    )
+endif()
+
 # Common source files
 set(COMMON_SOURCES
     src/icd_main.cpp
@@ -146,6 +240,7 @@ set(COMMON_SOURCES
     ${WSI_WAYLAND_SOURCES}
     ${WSI_HEADLESS_SOURCES}
     ${WSI_EXTENSION_SOURCES}
+    ${HUD_SOURCES}
 )
 
 # Generated Wayland protocol files (compiled as C, not C++)
@@ -207,6 +302,9 @@ set(COMMON_INCLUDES
     /usr/include
     /usr/include/drm
 )
+if(BUILD_HUD)
+    list(APPEND COMMON_INCLUDES ${STB_INCLUDE_DIR} ${HUD_GENERATED_DIR})
+endif()
 
 # Common compile definitions
 set(COMMON_DEFINITIONS
@@ -222,6 +320,8 @@ set(COMMON_DEFINITIONS
     SELECT_EXTERNAL_ALLOCATOR=${SELECT_EXTERNAL_ALLOCATOR}
     WSIALLOC_MEMORY_HEAP_NAME=${WSIALLOC_MEMORY_HEAP_NAME}
     ENABLE_ARM_NEON=1
+    BUILD_HUD=$<BOOL:${BUILD_HUD}>
+    MALI_HUD_TEST_BUILD=$<BOOL:${MALI_HUD_TEST_BUILD}>
 )
 
 # Common link libraries
@@ -267,6 +367,9 @@ function(create_wrapper_target ARCH_NAME ARCH_FLAGS)
 
     # Add dependency on wayland protocol generation
     add_dependencies(${TARGET_NAME} wayland_generated_files)
+    if(BUILD_HUD)
+        add_dependencies(${TARGET_NAME} hud_generated_files)
+    endif()
 
     # Add architecture-specific include directory (for config.hpp)
     target_include_directories(${TARGET_NAME} PRIVATE
@@ -288,6 +391,13 @@ function(create_wrapper_target ARCH_NAME ARCH_FLAGS)
         SOVERSION 1
         VERSION 1.0.0
     )
+
+    if(BUILD_TESTING)
+        file(GENERATE
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${TARGET_NAME}_test_icd.json
+            CONTENT "{\n  \"file_format_version\": \"1.0.0\",\n  \"ICD\": {\n    \"library_path\": \"$<TARGET_FILE:${TARGET_NAME}>\",\n    \"api_version\": \"${API_VERSION}\"\n  }\n}\n"
+        )
+    endif()
 
     # Install library to architecture-specific directory
     install(TARGETS ${TARGET_NAME}
@@ -377,4 +487,21 @@ message(STATUS "Mali Wrapper ICD Configuration:")
 message(STATUS "  64-bit wrapper: ${BUILD_64BIT}")
 message(STATUS "  32-bit wrapper: ${BUILD_32BIT}")
 message(STATUS "  Install ICDs: ${INSTALL_ICDS}")
+message(STATUS "  Integrated HUD: ${BUILD_HUD} (runtime opt-in)")
 message(STATUS "  Current architecture: ${CURRENT_ARCH}")
+
+if(BUILD_TESTING AND BUILD_HUD AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(mali_hud_tests
+        tests/hud_tests.cpp
+        src/hud/hud_config.cpp
+        src/hud/hud_metadata.cpp
+        src/hud/hud_metrics.cpp
+    )
+    target_include_directories(mali_hud_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${VULKAN_INCLUDE_DIRS}
+    )
+    target_compile_definitions(mali_hud_tests PRIVATE MALI_HUD_TEST_BUILD=1)
+    target_link_libraries(mali_hud_tests PRIVATE pthread)
+    add_test(NAME mali_hud_unit_tests COMMAND mali_hud_tests)
+endif()

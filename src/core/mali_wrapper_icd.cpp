@@ -4,6 +4,9 @@
 #include "wsi/wsi_private_data.hpp"
 #include "wsi/wsi_factory.hpp"
 #include "wsi/layer_utils/extension_list.hpp"
+#if BUILD_HUD
+#include "hud/hud_runtime.hpp"
+#endif
 #include <vulkan/vk_icd.h>
 #include "config.hpp"
 #include "../utils/logging.hpp"
@@ -1999,6 +2002,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateInstance(
     if (!pCreateInfo || !pInstance) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+
+#if BUILD_HUD
+    mali_wrapper::hud::HudRuntime::instance().capture_application(pCreateInfo->pApplicationInfo);
+#endif
 
     std::vector<const char *> enabled_extensions;
     std::unique_ptr<util::extension_list> instance_extension_list;

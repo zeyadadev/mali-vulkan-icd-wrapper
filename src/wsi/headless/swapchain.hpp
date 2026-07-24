@@ -53,6 +53,16 @@ public:
    ~swapchain();
 
 protected:
+   bool is_headless_swapchain() const override
+   {
+      return true;
+   }
+
+   const char *display_server_name() const override
+   {
+      return "Headless";
+   }
+
    /**
     * @brief Platform specific init
     */

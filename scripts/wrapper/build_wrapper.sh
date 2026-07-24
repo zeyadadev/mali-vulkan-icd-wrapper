@@ -182,7 +182,7 @@ configure_interactive_options_if_requested() {
     fi
 
     if is_true "${INSTALL_SYSTEM}"; then
-        # Install mode is opinionated: always clean conflicting system state first.
+        # Cleanup is automatic, but deferred until all selected builds succeed.
         CHECK_CONFLICTS="true"
         REMOVE_CONFLICTS="true"
         FORCE_REINSTALL="true"
@@ -288,6 +288,10 @@ install_build_dependencies_if_requested() {
         libxcb-sync-dev
         libxrandr-dev
         wayland-protocols
+        glslang-tools
+        libstb-dev
+        fonts-jetbrains-mono
+        python3
     )
 
     local cross_pkgs=(
@@ -578,11 +582,6 @@ configure_and_build_64() {
 
     echo "Building 64-bit wrapper"
     cmake --build "${BUILD64_DIR}" -j "${JOBS}"
-
-    if is_true "${INSTALL_SYSTEM}"; then
-        echo "Installing 64-bit wrapper"
-        run_as_root cmake --install "${BUILD64_DIR}"
-    fi
 }
 
 configure_and_build_32() {
@@ -611,9 +610,29 @@ configure_and_build_32() {
 
     echo "Building 32-bit wrapper"
     cmake --build "${BUILD32_DIR}" -j "${JOBS}"
+}
 
-    if is_true "${INSTALL_SYSTEM}"; then
+install_built_wrappers_if_requested() {
+    if ! is_true "${INSTALL_SYSTEM}"; then
+        return
+    fi
+
+    # Do not remove a working installation until every selected architecture
+    # has configured and built successfully.
+    check_for_old_or_conflicting_installations
+    prune_unselected_arch_installations_if_requested
+    force_reinstall_selected_arch_if_requested
+
+    if is_true "${BUILD_64BIT}"; then
+        echo "Installing 64-bit wrapper"
+        rm -f -- "${BUILD64_DIR}/install_manifest.txt"
+        : > "${BUILD64_DIR}/install_manifest.txt"
+        run_as_root cmake --install "${BUILD64_DIR}"
+    fi
+    if is_true "${BUILD_32BIT}"; then
         echo "Installing 32-bit wrapper"
+        rm -f -- "${BUILD32_DIR}/install_manifest.txt"
+        : > "${BUILD32_DIR}/install_manifest.txt"
         run_as_root cmake --install "${BUILD32_DIR}"
     fi
 }
@@ -806,9 +825,6 @@ done
 warn_if_prefix_manifest_mismatch
 warn_if_vulkan_env_overrides_present
 check_mali_driver_preflight
-check_for_old_or_conflicting_installations
-prune_unselected_arch_installations_if_requested
-force_reinstall_selected_arch_if_requested
 
 if is_true "${BUILD_64BIT}"; then
     configure_and_build_64
@@ -818,6 +834,7 @@ if is_true "${BUILD_32BIT}"; then
     configure_and_build_32
 fi
 
+install_built_wrappers_if_requested
 post_install_verification
 configure_dma_heap_permissions_if_requested
 

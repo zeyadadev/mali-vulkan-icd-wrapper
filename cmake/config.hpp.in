@@ -8,5 +8,7 @@ namespace mali_wrapper {
 // Build-time configuration paths
 constexpr const char* MALI_DRIVER_PATH = "@MALI_DRIVER_PATH@";
 constexpr const char* API_VERSION = "@API_VERSION@";
+constexpr const char* WRAPPER_VERSION = "@PROJECT_VERSION@";
+constexpr const char* WRAPPER_GIT_REVISION = "@MALI_WRAPPER_GIT_REVISION@";
 
 } // namespace mali_wrapper

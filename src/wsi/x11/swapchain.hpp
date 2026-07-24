@@ -141,6 +141,11 @@ public:
    ~swapchain();
 
 protected:
+   const char *display_server_name() const override
+   {
+      return "X11";
+   }
+
    /**
     * @brief Platform specific init
     */

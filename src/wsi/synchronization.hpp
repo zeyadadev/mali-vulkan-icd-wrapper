@@ -46,6 +46,9 @@ struct queue_submit_semaphores
    uint32_t wait_semaphores_count;
    const VkSemaphore *signal_semaphores;
    uint32_t signal_semaphores_count;
+   const VkCommandBuffer *command_buffers{ nullptr };
+   uint32_t command_buffer_count{ 0 };
+   VkPipelineStageFlags wait_stage{ VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT };
 };
 
 /**
@@ -180,7 +183,7 @@ private:
 };
 
 /**
- * @brief Submit an empty queue operation for synchronization.
+ * @brief Submit queue synchronization and optional wrapper-owned command buffers.
  *
  * @param device     The device private data for the fence.
  * @param queue      The Vulkan queue that may be used to submit synchronization commands.

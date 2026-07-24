@@ -7,7 +7,11 @@ set(CMAKE_CROSSCOMPILING TRUE)
 
 # Toolchain
 set(CMAKE_C_COMPILER arm-linux-gnueabihf-gcc)
-set(CMAKE_CXX_COMPILER arm-linux-gnueabihf-g++)
+if(DEFINED ENV{MALI_ARMHF_CXX_COMPILER})
+    set(CMAKE_CXX_COMPILER "$ENV{MALI_ARMHF_CXX_COMPILER}")
+else()
+    set(CMAKE_CXX_COMPILER arm-linux-gnueabihf-g++)
+endif()
 
 # Target sysroot and search paths
 set(_ARMHF_SYSROOT /usr/arm-linux-gnueabihf)

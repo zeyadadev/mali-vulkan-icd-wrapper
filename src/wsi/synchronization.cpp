@@ -176,7 +176,7 @@ VkResult sync_queue_submit(const wsi::device_private_data &device, VkQueue queue
     * want to block any future Vulkan queue work on it. So, we pass in BOTTOM_OF_PIPE bit as the
     * wait flag.
     */
-   VkPipelineStageFlags pipeline_stage_flag = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+   VkPipelineStageFlags pipeline_stage_flag = semaphores.wait_stage;
    VkPipelineStageFlags *pipeline_stage_flag_data = &pipeline_stage_flag;
 
    util::vector<VkPipelineStageFlags> pipeline_stage_flags_vector{ util::allocator(
@@ -188,8 +188,7 @@ VkResult sync_queue_submit(const wsi::device_private_data &device, VkQueue queue
       {
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
-      std::fill(pipeline_stage_flags_vector.begin(), pipeline_stage_flags_vector.end(),
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+      std::fill(pipeline_stage_flags_vector.begin(), pipeline_stage_flags_vector.end(), semaphores.wait_stage);
       pipeline_stage_flag_data = pipeline_stage_flags_vector.data();
    }
 
@@ -198,8 +197,8 @@ VkResult sync_queue_submit(const wsi::device_private_data &device, VkQueue queue
                                 semaphores.wait_semaphores_count,
                                 semaphores.wait_semaphores,
                                 pipeline_stage_flag_data,
-                                0,
-                                nullptr,
+                                semaphores.command_buffer_count,
+                                semaphores.command_buffers,
                                 semaphores.signal_semaphores_count,
                                 semaphores.signal_semaphores };
 
