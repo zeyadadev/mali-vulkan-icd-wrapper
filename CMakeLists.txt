@@ -24,6 +24,31 @@ option(MALI_HUD_TEST_BUILD "Enable HUD-only fault injection hooks" OFF)
 
 include(CTest)
 
+# Compatibility-chain copying is generated from the same Vulkan registry as
+# the installed headers. The generated file contains only sizeof expressions
+# and is architecture-neutral at generation time.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(VULKAN_REGISTRY_XML "/usr/share/vulkan/registry/vk.xml" CACHE FILEPATH
+    "Vulkan registry used to generate device-create pNext metadata")
+find_file(VULKAN_CORE_HEADER vulkan/vulkan_core.h
+    PATHS ${VULKAN_INCLUDE_DIRS} /usr/include /usr/local/include REQUIRED)
+if(NOT EXISTS "${VULKAN_REGISTRY_XML}")
+    message(FATAL_ERROR "Vulkan registry not found: ${VULKAN_REGISTRY_XML}")
+endif()
+set(COMPAT_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/compatibility)
+set(COMPAT_DEVICE_PNEXT_SIZES ${COMPAT_GENERATED_DIR}/device_pnext_sizes.inc)
+add_custom_command(
+    OUTPUT ${COMPAT_DEVICE_PNEXT_SIZES}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${COMPAT_GENERATED_DIR}
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_vk_device_pnext_sizes.py
+            ${VULKAN_REGISTRY_XML} ${VULKAN_CORE_HEADER} ${COMPAT_DEVICE_PNEXT_SIZES}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_vk_device_pnext_sizes.py
+            ${VULKAN_REGISTRY_XML}
+    VERBATIM
+)
+add_custom_target(compatibility_generated_files DEPENDS ${COMPAT_DEVICE_PNEXT_SIZES})
+
 execute_process(
     COMMAND git rev-parse --short=12 HEAD
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -57,7 +82,6 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(VULKAN REQUIRED vulkan)
 
 if(BUILD_HUD)
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     find_program(GLSLANG_VALIDATOR_EXECUTABLE glslangValidator)
     find_path(STB_INCLUDE_DIR stb/stb_truetype.h)
     if(NOT GLSLANG_VALIDATOR_EXECUTABLE)
@@ -229,12 +253,20 @@ if(BUILD_HUD)
     )
 endif()
 
+set(COMPATIBILITY_SOURCES
+    src/compatibility/pnext_chain.cpp
+    src/compatibility/compatibility_manager.cpp
+    src/compatibility/device_emulation.cpp
+    ${COMPAT_DEVICE_PNEXT_SIZES}
+)
+
 # Common source files
 set(COMMON_SOURCES
     src/icd_main.cpp
     src/core/mali_wrapper_icd.cpp
     src/core/library_loader.cpp
     src/utils/logging.cpp
+    ${COMPATIBILITY_SOURCES}
     ${WSI_SOURCES}
     ${WSI_X11_SOURCES}
     ${WSI_WAYLAND_SOURCES}
@@ -294,6 +326,7 @@ set(COMMON_INCLUDES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/wsi/layer_utils/wsialloc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/wsi/layer_utils
     ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
     ${VULKAN_INCLUDE_DIRS}
     ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${LIBDRM_INCLUDE_DIRS}
@@ -367,6 +400,7 @@ function(create_wrapper_target ARCH_NAME ARCH_FLAGS)
 
     # Add dependency on wayland protocol generation
     add_dependencies(${TARGET_NAME} wayland_generated_files)
+    add_dependencies(${TARGET_NAME} compatibility_generated_files)
     if(BUILD_HUD)
         add_dependencies(${TARGET_NAME} hud_generated_files)
     endif()
@@ -504,4 +538,124 @@ if(BUILD_TESTING AND BUILD_HUD AND NOT CMAKE_CROSSCOMPILING)
     target_compile_definitions(mali_hud_tests PRIVATE MALI_HUD_TEST_BUILD=1)
     target_link_libraries(mali_hud_tests PRIVATE pthread)
     add_test(NAME mali_hud_unit_tests COMMAND mali_hud_tests)
+endif()
+
+if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(mali_compatibility_tests
+        tests/compatibility_tests.cpp
+        src/compatibility/pnext_chain.cpp
+        src/compatibility/compatibility_manager.cpp
+        src/compatibility/device_emulation.cpp
+        src/utils/logging.cpp
+        ${COMPAT_DEVICE_PNEXT_SIZES}
+    )
+    add_dependencies(mali_compatibility_tests compatibility_generated_files)
+    target_include_directories(mali_compatibility_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+        ${VULKAN_INCLUDE_DIRS}
+    )
+    target_link_libraries(mali_compatibility_tests PRIVATE pthread)
+    add_test(NAME mali_compatibility_unit_tests COMMAND mali_compatibility_tests)
+
+    find_program(DESCRIPTOR_TEST_GLSLANG_VALIDATOR glslangValidator)
+    if(DESCRIPTOR_TEST_GLSLANG_VALIDATOR)
+        set(DESCRIPTOR_TEST_GENERATED_DIR
+            ${CMAKE_CURRENT_BINARY_DIR}/generated/descriptor_buffer_test)
+        set(DESCRIPTOR_STORAGE_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_storage_comp_spv.hpp)
+        set(DESCRIPTOR_IMAGE_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_image_comp_spv.hpp)
+        set(DESCRIPTOR_MUTABLE_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_mutable_comp_spv.hpp)
+        set(DESCRIPTOR_UNIFORM_ARRAY_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_uniform_array_comp_spv.hpp)
+        set(DESCRIPTOR_FIXED_ARRAY_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_fixed_array_comp_spv.hpp)
+
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_STORAGE_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_storage_comp_spv
+                    -o ${DESCRIPTOR_STORAGE_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_storage.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_storage.comp
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_IMAGE_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_image_comp_spv
+                    -o ${DESCRIPTOR_IMAGE_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_image.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_image.comp
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_MUTABLE_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_mutable_comp_spv
+                    -o ${DESCRIPTOR_MUTABLE_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_mutable.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_mutable.comp
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_UNIFORM_ARRAY_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_uniform_array_comp_spv
+                    -o ${DESCRIPTOR_UNIFORM_ARRAY_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_uniform_array.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_uniform_array.comp
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_FIXED_ARRAY_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_fixed_array_comp_spv
+                    -o ${DESCRIPTOR_FIXED_ARRAY_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_fixed_array.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_fixed_array.comp
+            VERBATIM
+        )
+
+        add_executable(mali_descriptor_buffer_gpu_test
+            tests/descriptor_buffer_gpu_test.cpp
+            ${DESCRIPTOR_STORAGE_SHADER_HEADER}
+            ${DESCRIPTOR_IMAGE_SHADER_HEADER}
+            ${DESCRIPTOR_MUTABLE_SHADER_HEADER}
+            ${DESCRIPTOR_UNIFORM_ARRAY_SHADER_HEADER}
+            ${DESCRIPTOR_FIXED_ARRAY_SHADER_HEADER}
+        )
+        target_include_directories(mali_descriptor_buffer_gpu_test PRIVATE
+            ${DESCRIPTOR_TEST_GENERATED_DIR}
+            ${VULKAN_INCLUDE_DIRS}
+        )
+        target_link_libraries(mali_descriptor_buffer_gpu_test PRIVATE
+            ${VULKAN_LIBRARIES}
+        )
+    else()
+        message(WARNING
+            "glslangValidator not found; descriptor-buffer GPU diagnostic disabled")
+    endif()
 endif()

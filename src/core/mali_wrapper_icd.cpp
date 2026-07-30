@@ -4,6 +4,8 @@
 #include "wsi/wsi_private_data.hpp"
 #include "wsi/wsi_factory.hpp"
 #include "wsi/layer_utils/extension_list.hpp"
+#include "compatibility/compatibility_manager.hpp"
+#include "compatibility/device_emulation.hpp"
 #if BUILD_HUD
 #include "hud/hud_runtime.hpp"
 #endif
@@ -748,200 +750,6 @@ static void log_low_address_map_summary()
                          ", copy_time=" + format_duration_ms(copy_time_ns));
 }
 
-struct DxvkFeatureSpoofConfig {
-    bool fill_mode_non_solid = false;
-    bool multi_viewport = false;
-    bool shader_clip_distance = false;
-    bool shader_cull_distance = false;
-    bool robust_buffer_access_2 = false;
-    bool hide_texture_compression_bc = false;
-};
-
-static const DxvkFeatureSpoofConfig& get_dxvk_feature_spoof_config()
-{
-    static DxvkFeatureSpoofConfig cached{};
-    static bool initialized = false;
-    if (initialized) {
-        return cached;
-    }
-
-    bool bundle_enabled = false;
-    if (getenv("MALI_WRAPPER_FAKE_DXVK_FEATURES") != nullptr) {
-        bundle_enabled = is_bool_env_enabled("MALI_WRAPPER_FAKE_DXVK_FEATURES", false);
-    }
-
-    cached.fill_mode_non_solid = bundle_enabled;
-    cached.multi_viewport = bundle_enabled;
-    cached.shader_clip_distance = bundle_enabled;
-    cached.shader_cull_distance = bundle_enabled;
-    cached.robust_buffer_access_2 = bundle_enabled;
-
-    if (getenv("MALI_WRAPPER_FAKE_FILL_MODE_NON_SOLID") != nullptr) {
-        cached.fill_mode_non_solid =
-            is_bool_env_enabled("MALI_WRAPPER_FAKE_FILL_MODE_NON_SOLID", cached.fill_mode_non_solid);
-    }
-
-    if (getenv("MALI_WRAPPER_FAKE_MULTI_VIEWPORT") != nullptr) {
-        cached.multi_viewport =
-            is_bool_env_enabled("MALI_WRAPPER_FAKE_MULTI_VIEWPORT", cached.multi_viewport);
-    }
-
-    if (getenv("MALI_WRAPPER_FAKE_SHADER_CLIP_DISTANCE") != nullptr) {
-        cached.shader_clip_distance =
-            is_bool_env_enabled("MALI_WRAPPER_FAKE_SHADER_CLIP_DISTANCE", cached.shader_clip_distance);
-    }
-
-    if (getenv("MALI_WRAPPER_FAKE_SHADER_CULL_DISTANCE") != nullptr) {
-        cached.shader_cull_distance =
-            is_bool_env_enabled("MALI_WRAPPER_FAKE_SHADER_CULL_DISTANCE", cached.shader_cull_distance);
-    }
-
-    if (getenv("MALI_WRAPPER_FAKE_ROBUST_BUFFER_ACCESS_2") != nullptr) {
-        cached.robust_buffer_access_2 =
-            is_bool_env_enabled("MALI_WRAPPER_FAKE_ROBUST_BUFFER_ACCESS_2", cached.robust_buffer_access_2);
-    }
-
-    if (getenv("MALI_WRAPPER_HIDE_TEXTURE_COMPRESSION_BC") != nullptr) {
-        cached.hide_texture_compression_bc =
-            is_bool_env_enabled("MALI_WRAPPER_HIDE_TEXTURE_COMPRESSION_BC", cached.hide_texture_compression_bc);
-    }
-
-    if (cached.fill_mode_non_solid || cached.multi_viewport ||
-        cached.shader_clip_distance || cached.shader_cull_distance ||
-        cached.robust_buffer_access_2) {
-        std::string features;
-        if (cached.fill_mode_non_solid) {
-            features += "fillModeNonSolid";
-        }
-        if (cached.multi_viewport) {
-            if (!features.empty()) {
-                features += ", ";
-            }
-            features += "multiViewport";
-        }
-        if (cached.shader_clip_distance) {
-            if (!features.empty()) {
-                features += ", ";
-            }
-            features += "shaderClipDistance";
-        }
-        if (cached.shader_cull_distance) {
-            if (!features.empty()) {
-                features += ", ";
-            }
-            features += "shaderCullDistance";
-        }
-        if (cached.robust_buffer_access_2) {
-            if (!features.empty()) {
-                features += ", ";
-            }
-            features += "robustBufferAccess2";
-        }
-
-        LOG_WARN("DXVK feature spoof enabled: advertising " + features);
-    }
-    if (cached.hide_texture_compression_bc) {
-        LOG_WARN("Feature override enabled: hiding textureCompressionBC");
-    }
-
-    initialized = true;
-    return cached;
-}
-
-static bool is_any_dxvk_feature_spoof_enabled()
-{
-    const auto& config = get_dxvk_feature_spoof_config();
-    return config.fill_mode_non_solid || config.multi_viewport ||
-           config.shader_clip_distance || config.shader_cull_distance ||
-           config.robust_buffer_access_2 || config.hide_texture_compression_bc;
-}
-
-static void advertise_spoofed_physical_features(VkPhysicalDeviceFeatures* features)
-{
-    if (features == nullptr) {
-        return;
-    }
-
-    const auto& config = get_dxvk_feature_spoof_config();
-    if (config.fill_mode_non_solid) {
-        features->fillModeNonSolid = VK_TRUE;
-    }
-    if (config.multi_viewport) {
-        features->multiViewport = VK_TRUE;
-    }
-    if (config.shader_clip_distance) {
-        features->shaderClipDistance = VK_TRUE;
-    }
-    if (config.shader_cull_distance) {
-        features->shaderCullDistance = VK_TRUE;
-    }
-    if (config.hide_texture_compression_bc) {
-        features->textureCompressionBC = VK_FALSE;
-    }
-}
-
-static void advertise_spoofed_physical_feature_chain(void* pnext)
-{
-    if (pnext == nullptr) {
-        return;
-    }
-
-    const auto& config = get_dxvk_feature_spoof_config();
-    auto* current = reinterpret_cast<VkBaseOutStructure*>(pnext);
-    while (current != nullptr) {
-        if (config.robust_buffer_access_2 &&
-            current->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
-            auto* robustness2 = reinterpret_cast<VkPhysicalDeviceRobustness2FeaturesEXT*>(current);
-            robustness2->robustBufferAccess2 = VK_TRUE;
-        }
-
-        current = current->pNext;
-    }
-}
-
-static void sanitize_requested_physical_features_for_driver(VkPhysicalDeviceFeatures* features)
-{
-    if (features == nullptr) {
-        return;
-    }
-
-    const auto& config = get_dxvk_feature_spoof_config();
-    if (config.fill_mode_non_solid) {
-        features->fillModeNonSolid = VK_FALSE;
-    }
-    if (config.multi_viewport) {
-        features->multiViewport = VK_FALSE;
-    }
-    if (config.shader_clip_distance) {
-        features->shaderClipDistance = VK_FALSE;
-    }
-    if (config.shader_cull_distance) {
-        features->shaderCullDistance = VK_FALSE;
-    }
-    if (config.hide_texture_compression_bc) {
-        features->textureCompressionBC = VK_FALSE;
-    }
-}
-
-static void sanitize_requested_physical_feature_chain_for_driver(const void* pnext)
-{
-    if (pnext == nullptr) {
-        return;
-    }
-
-    const auto& config = get_dxvk_feature_spoof_config();
-    auto* current = const_cast<VkBaseInStructure*>(reinterpret_cast<const VkBaseInStructure*>(pnext));
-    while (current != nullptr) {
-        if (config.robust_buffer_access_2 &&
-            current->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
-            auto* robustness2 = reinterpret_cast<VkPhysicalDeviceRobustness2FeaturesEXT*>(current);
-            robustness2->robustBufferAccess2 = VK_FALSE;
-        }
-
-        current = const_cast<VkBaseInStructure*>(current->pNext);
-    }
-}
-
 static bool is_pointer_32bit_compatible(const void* ptr)
 {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)) < kMax32BitAddressExclusive;
@@ -1606,35 +1414,29 @@ static T get_mali_instance_proc_for_physical_device(VkPhysicalDevice physicalDev
     return reinterpret_cast<T>(LibraryLoader::Instance().GetMaliProcAddr(proc_name));
 }
 
-struct DeviceCreateInfoFeatureSpoofCopies {
-    VkPhysicalDeviceFeatures enabled_features{};
-    VkPhysicalDeviceFeatures2 features2{};
-};
-
-static void sanitize_device_create_info_for_driver(VkDeviceCreateInfo* create_info,
-                                                   DeviceCreateInfoFeatureSpoofCopies* spoof_copies)
+static void register_compatibility_device(
+    VkDevice device,
+    VkPhysicalDevice physical_device,
+    compatibility::ProfileSelection selection)
 {
-    if (create_info == nullptr || spoof_copies == nullptr || !is_any_dxvk_feature_spoof_enabled()) {
+    auto dispatch = get_managed_device_dispatch(device);
+    if (dispatch == nullptr) {
         return;
     }
 
-    if (create_info->pEnabledFeatures != nullptr) {
-        spoof_copies->enabled_features = *create_info->pEnabledFeatures;
-        sanitize_requested_physical_features_for_driver(&spoof_copies->enabled_features);
-        create_info->pEnabledFeatures = &spoof_copies->enabled_features;
+    VkPhysicalDeviceMemoryProperties memory_properties{};
+    if (auto raw = get_mali_instance_proc_for_physical_device<
+            PFN_vkGetPhysicalDeviceMemoryProperties>(
+            physical_device, "vkGetPhysicalDeviceMemoryProperties")) {
+        raw(physical_device, &memory_properties);
     }
-
-    const auto* base = reinterpret_cast<const VkBaseInStructure*>(create_info->pNext);
-    if (base != nullptr && base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
-        spoof_copies->features2 = *reinterpret_cast<const VkPhysicalDeviceFeatures2*>(base);
-        sanitize_requested_physical_features_for_driver(&spoof_copies->features2.features);
-        sanitize_requested_physical_feature_chain_for_driver(spoof_copies->features2.pNext);
-        create_info->pNext = &spoof_copies->features2;
-    } else {
-        sanitize_requested_physical_feature_chain_for_driver(create_info->pNext);
-    }
+    compatibility::device_emulation::register_device(
+        device,
+        physical_device,
+        selection,
+        dispatch->get_device_proc_addr,
+        memory_properties);
 }
-
 
 static const std::unordered_set<std::string> wsi_functions = {
     // Surface functions
@@ -1907,12 +1709,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL dummy_set_instance_loader_data(VkInstance 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkDevice device, const char* pName);
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice);
 static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhysicalDeviceCount, VkPhysicalDevice* pPhysicalDevices);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* pPhysicalDeviceGroupCount, VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties);
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumeratePhysicalDeviceGroupsKHR(VkInstance instance, uint32_t* pPhysicalDeviceGroupCount, VkPhysicalDeviceGroupPropertiesKHR* pPhysicalDeviceGroupProperties);
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImage* pImage);
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount, const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines);
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties);
 static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures* pFeatures);
 static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* pFeatures);
 static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures2KHR(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2KHR* pFeatures);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties* pProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceProperties2KHR(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2KHR* pProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties* pQueueFamilyProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties2* pQueueFamilyProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceQueueFamilyProperties2KHR(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties2KHR* pQueueFamilyProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageTiling tiling, uint32_t* pPropertyCount, VkSparseImageFormatProperties* pProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSparseImageFormatInfo2* pFormatInfo, uint32_t* pPropertyCount, VkSparseImageFormatProperties2* pProperties);
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSparseImageFormatInfo2KHR* pFormatInfo, uint32_t* pPropertyCount, VkSparseImageFormatProperties2KHR* pProperties);
 static VKAPI_ATTR VkResult VKAPI_CALL mali_driver_create_device(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice);
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkAllocateMemory(
     VkDevice device,
@@ -2090,6 +1904,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateInstance(
     VkResult result = mali_create_instance(&modified_create_info, pAllocator, pInstance);
 
     if (result == VK_SUCCESS) {
+        compatibility::register_instance(*pInstance, pCreateInfo->pApplicationInfo);
         std::lock_guard<std::mutex> lock(instance_mutex);
         auto existing = managed_instances.find(*pInstance);
         if (existing == managed_instances.end()) {
@@ -2186,6 +2001,7 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyInstance(
     }
 
     GetWSIManager().release_instance(instance);
+    compatibility::unregister_instance(instance);
     LOG_INFO("Instance destroyed successfully");
 }
 
@@ -2275,6 +2091,79 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumerateInstanceExtensionPrope
     return copy_count < combined_extensions.size() ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumeratePhysicalDevices(
+    VkInstance instance,
+    uint32_t* pPhysicalDeviceCount,
+    VkPhysicalDevice* pPhysicalDevices)
+{
+    using namespace mali_wrapper;
+
+    if (pPhysicalDeviceCount == nullptr) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    auto gipa = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
+    auto raw = gipa != nullptr
+        ? reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+              gipa(instance, "vkEnumeratePhysicalDevices"))
+        : nullptr;
+    if (raw == nullptr) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkResult result = raw(instance, pPhysicalDeviceCount, pPhysicalDevices);
+    if ((result == VK_SUCCESS || result == VK_INCOMPLETE) && pPhysicalDevices != nullptr) {
+        for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
+            compatibility::associate_physical_device(instance, pPhysicalDevices[i]);
+        }
+    }
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumeratePhysicalDeviceGroups(
+    VkInstance instance,
+    uint32_t* pPhysicalDeviceGroupCount,
+    VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties)
+{
+    using namespace mali_wrapper;
+
+    if (pPhysicalDeviceGroupCount == nullptr) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    auto gipa = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
+    auto raw = gipa != nullptr
+        ? reinterpret_cast<PFN_vkEnumeratePhysicalDeviceGroups>(
+              gipa(instance, "vkEnumeratePhysicalDeviceGroups"))
+        : nullptr;
+    if (raw == nullptr) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+
+    VkResult result = raw(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+    if ((result == VK_SUCCESS || result == VK_INCOMPLETE) &&
+        pPhysicalDeviceGroupProperties != nullptr) {
+        for (uint32_t group = 0; group < *pPhysicalDeviceGroupCount; ++group) {
+            for (uint32_t device = 0;
+                 device < pPhysicalDeviceGroupProperties[group].physicalDeviceCount;
+                 ++device) {
+                compatibility::associate_physical_device(
+                    instance, pPhysicalDeviceGroupProperties[group].physicalDevices[device]);
+            }
+        }
+    }
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumeratePhysicalDeviceGroupsKHR(
+    VkInstance instance,
+    uint32_t* pPhysicalDeviceGroupCount,
+    VkPhysicalDeviceGroupPropertiesKHR* pPhysicalDeviceGroupProperties)
+{
+    return internal_vkEnumeratePhysicalDeviceGroups(
+        instance,
+        pPhysicalDeviceGroupCount,
+        reinterpret_cast<VkPhysicalDeviceGroupProperties*>(pPhysicalDeviceGroupProperties));
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumerateDeviceExtensionProperties(
     VkPhysicalDevice physicalDevice,
     const char* pLayerName,
@@ -2299,7 +2188,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumerateDeviceExtensionPropert
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    if (pLayerName != nullptr || !should_filter_external_memory_host_extension()) {
+    if (pLayerName != nullptr) {
         return mali_enumerate(physicalDevice, pLayerName, pPropertyCount, pProperties);
     }
 
@@ -2318,26 +2207,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkEnumerateDeviceExtensionPropert
         mali_extensions.resize(mali_count);
     }
 
-    std::vector<VkExtensionProperties> filtered_extensions;
-    filtered_extensions.reserve(mali_extensions.size());
+    std::vector<VkExtensionProperties> exposed_extensions;
+    exposed_extensions.reserve(mali_extensions.size() + 1);
     for (const auto& extension : mali_extensions) {
-        if (!is_filtered_device_extension(extension.extensionName)) {
-            filtered_extensions.push_back(extension);
+        if (!should_filter_external_memory_host_extension() ||
+            !is_filtered_device_extension(extension.extensionName)) {
+            exposed_extensions.push_back(extension);
         }
     }
+    compatibility::overlay_device_extensions(
+        compatibility::selection_for(physicalDevice), &exposed_extensions);
 
     if (pProperties == nullptr) {
-        *pPropertyCount = static_cast<uint32_t>(filtered_extensions.size());
+        *pPropertyCount = static_cast<uint32_t>(exposed_extensions.size());
         return VK_SUCCESS;
     }
 
-    const uint32_t copy_count = std::min(*pPropertyCount, static_cast<uint32_t>(filtered_extensions.size()));
+    const uint32_t copy_count = std::min(*pPropertyCount, static_cast<uint32_t>(exposed_extensions.size()));
     for (uint32_t i = 0; i < copy_count; i++) {
-        pProperties[i] = filtered_extensions[i];
+        pProperties[i] = exposed_extensions[i];
     }
 
     *pPropertyCount = copy_count;
-    return copy_count < filtered_extensions.size() ? VK_INCOMPLETE : VK_SUCCESS;
+    return copy_count < exposed_extensions.size() ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetInstanceProcAddr(VkInstance instance, const char* pName) {
@@ -2368,6 +2260,18 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetInstanceProcAddr(V
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkEnumerateInstanceExtensionProperties);
     }
 
+    if (strcmp(pName, "vkEnumeratePhysicalDevices") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkEnumeratePhysicalDevices);
+    }
+
+    if (strcmp(pName, "vkEnumeratePhysicalDeviceGroups") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkEnumeratePhysicalDeviceGroups);
+    }
+
+    if (strcmp(pName, "vkEnumeratePhysicalDeviceGroupsKHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkEnumeratePhysicalDeviceGroupsKHR);
+    }
+
     if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkEnumerateDeviceExtensionProperties);
     }
@@ -2390,6 +2294,45 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetInstanceProcAddr(V
 
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetPhysicalDeviceFeatures2KHR);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetPhysicalDeviceProperties);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetPhysicalDeviceProperties2);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetPhysicalDeviceProperties2KHR);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetPhysicalDeviceQueueFamilyProperties);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetPhysicalDeviceQueueFamilyProperties2);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2KHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(internal_vkGetPhysicalDeviceQueueFamilyProperties2KHR);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceSparseImageFormatProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(
+            internal_vkGetPhysicalDeviceSparseImageFormatProperties);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceSparseImageFormatProperties2") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(
+            internal_vkGetPhysicalDeviceSparseImageFormatProperties2);
+    }
+
+    if (strcmp(pName, "vkGetPhysicalDeviceSparseImageFormatProperties2KHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(
+            internal_vkGetPhysicalDeviceSparseImageFormatProperties2KHR);
     }
 
     if (GetWSIManager().is_wsi_function(pName)) {
@@ -2434,7 +2377,7 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures(
         std::memset(pFeatures, 0, sizeof(*pFeatures));
     }
 
-    advertise_spoofed_physical_features(pFeatures);
+    compatibility::overlay_features(compatibility::selection_for(physicalDevice), pFeatures);
 }
 
 static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures2(
@@ -2463,8 +2406,9 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures2(
         }
     }
 
-    advertise_spoofed_physical_features(&pFeatures->features);
-    advertise_spoofed_physical_feature_chain(pFeatures->pNext);
+    const auto selection = compatibility::selection_for(physicalDevice);
+    compatibility::overlay_features(selection, &pFeatures->features);
+    compatibility::overlay_feature_chain(selection, pFeatures->pNext);
 }
 
 static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures2KHR(
@@ -2472,6 +2416,221 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceFeatures2KHR(
     VkPhysicalDeviceFeatures2KHR* pFeatures)
 {
     internal_vkGetPhysicalDeviceFeatures2(physicalDevice, reinterpret_cast<VkPhysicalDeviceFeatures2*>(pFeatures));
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceProperties(
+    VkPhysicalDevice physicalDevice,
+    VkPhysicalDeviceProperties* pProperties)
+{
+    using namespace mali_wrapper;
+    if (pProperties == nullptr) {
+        return;
+    }
+    auto raw = get_mali_instance_proc_for_physical_device<PFN_vkGetPhysicalDeviceProperties>(
+        physicalDevice, "vkGetPhysicalDeviceProperties");
+    if (raw != nullptr) {
+        raw(physicalDevice, pProperties);
+    } else {
+        std::memset(pProperties, 0, sizeof(*pProperties));
+    }
+    compatibility::overlay_properties(compatibility::selection_for(physicalDevice), pProperties);
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceProperties2(
+    VkPhysicalDevice physicalDevice,
+    VkPhysicalDeviceProperties2* pProperties)
+{
+    using namespace mali_wrapper;
+    if (pProperties == nullptr) {
+        return;
+    }
+
+    auto raw = get_mali_instance_proc_for_physical_device<PFN_vkGetPhysicalDeviceProperties2>(
+        physicalDevice, "vkGetPhysicalDeviceProperties2");
+    if (raw != nullptr) {
+        raw(physicalDevice, pProperties);
+    } else {
+        auto raw_khr = get_mali_instance_proc_for_physical_device<PFN_vkGetPhysicalDeviceProperties2KHR>(
+            physicalDevice, "vkGetPhysicalDeviceProperties2KHR");
+        if (raw_khr != nullptr) {
+            raw_khr(physicalDevice, reinterpret_cast<VkPhysicalDeviceProperties2KHR*>(pProperties));
+            raw = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(raw_khr);
+        } else {
+            internal_vkGetPhysicalDeviceProperties(physicalDevice, &pProperties->properties);
+        }
+    }
+
+    const auto selection = compatibility::selection_for(physicalDevice);
+    compatibility::overlay_properties(selection, &pProperties->properties);
+    compatibility::overlay_property_chain(selection, physicalDevice, pProperties->pNext, raw);
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceProperties2KHR(
+    VkPhysicalDevice physicalDevice,
+    VkPhysicalDeviceProperties2KHR* pProperties)
+{
+    internal_vkGetPhysicalDeviceProperties2(
+        physicalDevice, reinterpret_cast<VkPhysicalDeviceProperties2*>(pProperties));
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceQueueFamilyProperties(
+    VkPhysicalDevice physicalDevice,
+    uint32_t* pQueueFamilyPropertyCount,
+    VkQueueFamilyProperties* pQueueFamilyProperties)
+{
+    using namespace mali_wrapper;
+    if (pQueueFamilyPropertyCount == nullptr) {
+        return;
+    }
+    auto raw =
+        get_mali_instance_proc_for_physical_device<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+            physicalDevice, "vkGetPhysicalDeviceQueueFamilyProperties");
+    if (raw == nullptr) {
+        *pQueueFamilyPropertyCount = 0;
+        return;
+    }
+    raw(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+    compatibility::overlay_queue_families(
+        compatibility::selection_for(physicalDevice),
+        pQueueFamilyProperties != nullptr ? *pQueueFamilyPropertyCount : 0,
+        pQueueFamilyProperties);
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceQueueFamilyProperties2(
+    VkPhysicalDevice physicalDevice,
+    uint32_t* pQueueFamilyPropertyCount,
+    VkQueueFamilyProperties2* pQueueFamilyProperties)
+{
+    using namespace mali_wrapper;
+    if (pQueueFamilyPropertyCount == nullptr) {
+        return;
+    }
+    auto raw =
+        get_mali_instance_proc_for_physical_device<PFN_vkGetPhysicalDeviceQueueFamilyProperties2>(
+            physicalDevice, "vkGetPhysicalDeviceQueueFamilyProperties2");
+    if (raw != nullptr) {
+        raw(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+    } else {
+        auto raw_khr =
+            get_mali_instance_proc_for_physical_device<PFN_vkGetPhysicalDeviceQueueFamilyProperties2KHR>(
+                physicalDevice, "vkGetPhysicalDeviceQueueFamilyProperties2KHR");
+        if (raw_khr != nullptr) {
+            raw_khr(physicalDevice, pQueueFamilyPropertyCount,
+                    reinterpret_cast<VkQueueFamilyProperties2KHR*>(pQueueFamilyProperties));
+        } else {
+            *pQueueFamilyPropertyCount = 0;
+            return;
+        }
+    }
+    compatibility::overlay_queue_families2(
+        compatibility::selection_for(physicalDevice),
+        pQueueFamilyProperties != nullptr ? *pQueueFamilyPropertyCount : 0,
+        pQueueFamilyProperties);
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceQueueFamilyProperties2KHR(
+    VkPhysicalDevice physicalDevice,
+    uint32_t* pQueueFamilyPropertyCount,
+    VkQueueFamilyProperties2KHR* pQueueFamilyProperties)
+{
+    internal_vkGetPhysicalDeviceQueueFamilyProperties2(
+        physicalDevice,
+        pQueueFamilyPropertyCount,
+        reinterpret_cast<VkQueueFamilyProperties2*>(pQueueFamilyProperties));
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceSparseImageFormatProperties(
+    VkPhysicalDevice physicalDevice,
+    VkFormat format,
+    VkImageType type,
+    VkSampleCountFlagBits samples,
+    VkImageUsageFlags usage,
+    VkImageTiling tiling,
+    uint32_t* pPropertyCount,
+    VkSparseImageFormatProperties* pProperties)
+{
+    using namespace mali_wrapper;
+    if (pPropertyCount == nullptr) {
+        return;
+    }
+    if (compatibility::device_emulation::unsafe_sparse_enabled(physicalDevice)) {
+        compatibility::device_emulation::get_sparse_image_format_properties(
+            physicalDevice, format, type, samples, usage, tiling,
+            pPropertyCount, pProperties);
+        return;
+    }
+    auto raw = get_mali_instance_proc_for_physical_device<
+        PFN_vkGetPhysicalDeviceSparseImageFormatProperties>(
+        physicalDevice, "vkGetPhysicalDeviceSparseImageFormatProperties");
+    if (raw != nullptr) {
+        raw(physicalDevice, format, type, samples, usage, tiling,
+            pPropertyCount, pProperties);
+    } else {
+        *pPropertyCount = 0;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceSparseImageFormatProperties2(
+    VkPhysicalDevice physicalDevice,
+    const VkPhysicalDeviceSparseImageFormatInfo2* pFormatInfo,
+    uint32_t* pPropertyCount,
+    VkSparseImageFormatProperties2* pProperties)
+{
+    using namespace mali_wrapper;
+    if (pPropertyCount == nullptr) {
+        return;
+    }
+    if (compatibility::device_emulation::unsafe_sparse_enabled(physicalDevice) &&
+        pFormatInfo != nullptr) {
+        uint32_t count = *pPropertyCount;
+        VkSparseImageFormatProperties legacy{};
+        compatibility::device_emulation::get_sparse_image_format_properties(
+            physicalDevice,
+            pFormatInfo->format,
+            pFormatInfo->type,
+            pFormatInfo->samples,
+            pFormatInfo->usage,
+            pFormatInfo->tiling,
+            &count,
+            pProperties != nullptr ? &legacy : nullptr);
+        if (pProperties != nullptr && count != 0) {
+            pProperties[0].properties = legacy;
+        }
+        *pPropertyCount = count;
+        return;
+    }
+    auto raw = get_mali_instance_proc_for_physical_device<
+        PFN_vkGetPhysicalDeviceSparseImageFormatProperties2>(
+        physicalDevice, "vkGetPhysicalDeviceSparseImageFormatProperties2");
+    if (raw != nullptr) {
+        raw(physicalDevice, pFormatInfo, pPropertyCount, pProperties);
+        return;
+    }
+    auto raw_khr = get_mali_instance_proc_for_physical_device<
+        PFN_vkGetPhysicalDeviceSparseImageFormatProperties2KHR>(
+        physicalDevice, "vkGetPhysicalDeviceSparseImageFormatProperties2KHR");
+    if (raw_khr != nullptr) {
+        raw_khr(
+            physicalDevice,
+            reinterpret_cast<const VkPhysicalDeviceSparseImageFormatInfo2KHR*>(pFormatInfo),
+            pPropertyCount,
+            reinterpret_cast<VkSparseImageFormatProperties2KHR*>(pProperties));
+    } else {
+        *pPropertyCount = 0;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL internal_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(
+    VkPhysicalDevice physicalDevice,
+    const VkPhysicalDeviceSparseImageFormatInfo2KHR* pFormatInfo,
+    uint32_t* pPropertyCount,
+    VkSparseImageFormatProperties2KHR* pProperties)
+{
+    internal_vkGetPhysicalDeviceSparseImageFormatProperties2(
+        physicalDevice,
+        reinterpret_cast<const VkPhysicalDeviceSparseImageFormatInfo2*>(pFormatInfo),
+        pPropertyCount,
+        reinterpret_cast<VkSparseImageFormatProperties2*>(pProperties));
 }
 
 template <typename T>
@@ -3178,6 +3337,7 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkGetDeviceQueue(
 
     if (pQueue != nullptr && *pQueue != VK_NULL_HANDLE) {
         mali_wrapper::register_queue_key_mapping(device, *pQueue);
+        mali_wrapper::compatibility::device_emulation::associate_queue(device, *pQueue);
     }
 }
 
@@ -3208,6 +3368,7 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkGetDeviceQueue2(
 
     if (*pQueue != VK_NULL_HANDLE) {
         mali_wrapper::register_queue_key_mapping(device, *pQueue);
+        mali_wrapper::compatibility::device_emulation::associate_queue(device, *pQueue);
     }
 }
 
@@ -3239,13 +3400,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateGraphicsPipelines(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
+    mali_wrapper::compatibility::device_emulation::GraphicsPipelineTransform transform;
+    transform.prepare(device, createInfoCount, pCreateInfos);
+
     bool trapped_signal = false;
     return mali_wrapper::call_vkCreateGraphicsPipelines_with_signal_guard(
         mali_create_graphics_pipelines,
         device,
         pipelineCache,
         createInfoCount,
-        pCreateInfos,
+        transform.get(),
         pAllocator,
         pPipelines,
         &trapped_signal);
@@ -3256,6 +3420,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL internal_vkGetDeviceProcAddr(VkD
 
     if (!pName) {
         return nullptr;
+    }
+
+    if (auto hook = compatibility::device_emulation::get_device_hook(device, pName)) {
+        return hook;
     }
 
     if (strcmp(pName, "vkDestroyDevice") == 0) {
@@ -3474,11 +3642,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateDevice(
         }
     }
 
-    VkDeviceCreateInfo modified_create_info = *pCreateInfo;
-    modified_create_info.enabledExtensionCount = static_cast<uint32_t>(extension_name_count);
-    modified_create_info.ppEnabledExtensionNames = extension_name_ptr;
-    DeviceCreateInfoFeatureSpoofCopies spoof_copies{};
-    sanitize_device_create_info_for_driver(&modified_create_info, &spoof_copies);
+    compatibility::DeviceCreateTransform compatibility_transform;
+    const auto compatibility_selection = compatibility::selection_for(physicalDevice);
+    if (!compatibility_transform.prepare(
+            compatibility_selection,
+            pCreateInfo,
+            extension_name_ptr,
+            static_cast<uint32_t>(extension_name_count))) {
+        LOG_ERROR("Unable to transform VkDeviceCreateInfo for compatibility profile: " +
+                  compatibility_transform.error());
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    const VkDeviceCreateInfo* modified_create_info = compatibility_transform.get();
 
     auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
     if (!mali_proc_addr) {
@@ -3502,12 +3677,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL internal_vkCreateDevice(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    VkResult result = mali_create_device(physicalDevice, &modified_create_info, pAllocator, pDevice);
+    VkResult result = mali_create_device(physicalDevice, modified_create_info, pAllocator, pDevice);
 
     if (result == VK_SUCCESS) {
         LOG_INFO("Device created successfully through Mali driver");
 
         remember_managed_device(*pDevice, mali_instance);
+        register_compatibility_device(
+            *pDevice, physicalDevice, compatibility_selection);
 
         VkInstance target_mali_instance = mali_instance;
         {
@@ -3558,6 +3735,7 @@ static VKAPI_ATTR void VKAPI_CALL internal_vkDestroyDevice(
     }
 
     remove_tracking_for_device(device);
+    compatibility::device_emulation::unregister_device(device);
 
     auto device_dispatch = forget_managed_device(device);
     VkInstance parent_instance = (device_dispatch != nullptr)
@@ -3627,11 +3805,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL mali_driver_create_device(
         }
     }
 
-    VkDeviceCreateInfo modified_create_info = *pCreateInfo;
-    modified_create_info.enabledExtensionCount = static_cast<uint32_t>(extension_name_count);
-    modified_create_info.ppEnabledExtensionNames = extension_name_ptr;
-    DeviceCreateInfoFeatureSpoofCopies spoof_copies{};
-    sanitize_device_create_info_for_driver(&modified_create_info, &spoof_copies);
+    compatibility::DeviceCreateTransform compatibility_transform;
+    const auto compatibility_selection = compatibility::selection_for(physicalDevice);
+    if (!compatibility_transform.prepare(
+            compatibility_selection,
+            pCreateInfo,
+            extension_name_ptr,
+            static_cast<uint32_t>(extension_name_count))) {
+        LOG_ERROR("Unable to transform VkDeviceCreateInfo for compatibility profile: " +
+                  compatibility_transform.error());
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    const VkDeviceCreateInfo* modified_create_info = compatibility_transform.get();
 
     auto mali_proc_addr = LibraryLoader::Instance().GetMaliGetInstanceProcAddr();
     if (!mali_proc_addr) {
@@ -3673,7 +3858,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL mali_driver_create_device(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    VkResult result = mali_create_device(physicalDevice, &modified_create_info, pAllocator, pDevice);
+    VkResult result = mali_create_device(physicalDevice, modified_create_info, pAllocator, pDevice);
 
     if (result == VK_SUCCESS) {
         VkInstance target_mali_instance = mali_instance;
@@ -3688,10 +3873,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL mali_driver_create_device(
         }
 
         remember_managed_device(*pDevice, mali_instance);
+        register_compatibility_device(
+            *pDevice, physicalDevice, compatibility_selection);
 
         VkResult wsi_result = GetWSIManager().init_device(target_mali_instance, physicalDevice, *pDevice,
-                                                         modified_create_info.ppEnabledExtensionNames,
-                                                         modified_create_info.enabledExtensionCount);
+                                                         modified_create_info->ppEnabledExtensionNames,
+                                                         modified_create_info->enabledExtensionCount);
         if (wsi_result != VK_SUCCESS) {
             LOG_ERROR("Failed to initialize WSI manager for device, error: " + std::to_string(wsi_result));
         } else {

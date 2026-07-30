@@ -1,173 +1,195 @@
-# Xwayland dmabuf bridge
+# Legacy Xwayland dmabuf bridge
 
-This repository carries an out-of-tree Xwayland patch series for a single-window X11 zero-copy path over Wayland.
+The private dmabuf bridge is an out-of-tree Xwayland protocol for handing an
+X11 swapchain image to Xwayland over a Unix `SOCK_SEQPACKET` socket. It predates
+the wrapper's DRI3 presenter and is now kept as a fallback and debugging path.
 
-## What is in-repo
+Use the normal DRI3 path when it works. The bridge changes Xwayland, introduces
+a private protocol, and has less runtime coverage.
 
-- Patch series:
-  - `patches/xwayland/0001-xwayland-dmabuf-bridge-poc.patch`
-  - `patches/xwayland/0002-xwayland-dmabuf-bridge-feedback-sync.patch`
-  - `patches/xwayland/0003-xwayland-dmabuf-bridge-frame-callback-paced-feedback.patch`
-  - `patches/xwayland/0004-xwayland-dmabuf-bridge-feedback-on-frame-callback.patch`
-- Build helper:
-  - `scripts/xwayland/build_patched_xwayland.sh`
+## Repository contents
 
-Patch summary:
+The Xwayland patch series currently contains:
 
-- `0001`: initial dmabuf bridge socket + packet ABI + import/commit path.
-- `0002`: bridge sync protocol (`HELLO` / `FEEDBACK`) for ACK-based pacing in wrapper.
-- `0003`: gate success feedback using frame callback pacing behavior.
-- `0004`: finalize success feedback semantics on `wl_surface.frame` callback (present cadence).
+| Patch | Purpose |
+| --- | --- |
+| `0001-xwayland-glamor-gbm-make-wl-drm-optional.patch` | Discover the main device without requiring `wl_drm` |
+| `0002-xwayland-glamor-gbm-enable-mali-dmabuf-v3.patch` | Enable the Mali DMA-BUF v3 path |
+| `0003-xwayland-glamor-gbm-skip-invalid-modifier-attrs.patch` | Avoid invalid modifier attributes |
+| `0004-xwayland-glamor-finish-for-mali-sync.patch` | Complete glamor work for Mali synchronization |
+| `0005-render-add-a4-picture-format.patch` | Add the A4 picture format needed by the target stack |
+| `0006-xwayland-dmabuf-bridge-poc.patch` | Add the private socket and frame import path |
+| `0007-xwayland-dmabuf-bridge-feedback-sync.patch` | Add bridge hello and feedback packets |
+| `0008-xwayland-dmabuf-bridge-frame-callback-paced-feedback.patch` | Pace feedback with frame callbacks |
+| `0009-xwayland-dmabuf-bridge-feedback-on-frame-callback.patch` | Finalize callback feedback behavior |
+| `0010-xserver-meson-dri-fallback-to-xf86driproto.patch` | Add the Meson DRI protocol fallback |
+| `0011-xwayland-dmabuf-bridge-glamor-guard.patch` | Guard bridge glamor integration |
 
-The script clones upstream `xserver`, checks out `xwayland-23.2.6`, applies local patches, builds, and installs into:
+The build helper is:
 
-- `third_party/xserver/_install-bridge/bin/Xwayland`
-
-Note: the script runs `git reset --hard` and `git clean -fd` in `XSERVER_DIR`.
-
-## Prerequisites
-
-```bash
-sudo apt update
-sudo apt install git meson ninja-build ccache pkg-config
-sudo apt install libxkbfile-dev libxshmfence-dev libxfont-dev libfontenc-dev libxcvt-dev
-# optional; if installed, you may set XSERVER_SECURE_RPC=true
-sudo apt install libtirpc-dev
+```text
+scripts/xwayland/build_patched_xwayland.sh
 ```
 
-You can also let the build script install these dependencies automatically on apt-based systems:
+It clones X.Org xserver, checks out `xwayland-23.2.6`, applies every
+`patches/xwayland/*.patch` in lexical order, builds with glamor and DRI3, and
+installs into:
 
-```bash
-XSERVER_INSTALL_BUILD_DEPS=1 ./scripts/xwayland/build_patched_xwayland.sh
+```text
+third_party/xserver/_install-bridge/bin/Xwayland
 ```
 
-## Build patched Xwayland
+## Build
+
+Run:
 
 ```bash
 ./scripts/xwayland/build_patched_xwayland.sh
 ```
 
-By default, when run in a terminal, the script is interactive and prompts for:
-
-- dependency install
-- system install to `/usr/bin/Xwayland`
-- persistent bridge env setup (`~/.config/environment.d/90-xwl-bridge.conf`)
-- reboot after install
-
-Control this with:
+On apt-based systems, the script can install its build dependencies:
 
 ```bash
-# force interactive prompts
-XSERVER_INTERACTIVE=1 ./scripts/xwayland/build_patched_xwayland.sh
-
-# force non-interactive behavior (use env flags only)
-XSERVER_INTERACTIVE=0 ./scripts/xwayland/build_patched_xwayland.sh
+XSERVER_INSTALL_BUILD_DEPS=1 \
+./scripts/xwayland/build_patched_xwayland.sh
 ```
 
-Useful overrides:
+Important controls are:
+
+| Variable | Default |
+| --- | --- |
+| `XSERVER_REPO` | `https://gitlab.freedesktop.org/xorg/xserver.git` |
+| `XSERVER_TAG` | `xwayland-23.2.6` |
+| `XSERVER_DIR` | `third_party/xserver` inside the repository |
+| `BUILD_DIR` | `third_party/xserver/build-bridge` |
+| `PREFIX_DIR` | `third_party/xserver/_install-bridge` |
+| `XSERVER_SECURE_RPC` | `0` |
+| `XSERVER_INSTALL_BUILD_DEPS` | `0` |
+| `XSERVER_INSTALL_SYSTEM` | `0` |
+| `XSERVER_REBOOT_AFTER_INSTALL` | `0` |
+| `XSERVER_INTERACTIVE` | `auto` |
+
+`MESON_EXTRA_ARGS` adds custom Meson arguments.
+
+The helper always resets the selected `XSERVER_DIR` to the chosen tag and runs
+`git clean -fd` before applying patches. Do not point it at an xserver checkout
+with local work you need to keep.
+
+## Install into the desktop session
+
+The system install is opt-in:
 
 ```bash
-# choose a different checkout dir
-XSERVER_DIR=/tmp/xserver ./scripts/xwayland/build_patched_xwayland.sh
-
-# pass extra Meson options
-MESON_EXTRA_ARGS='-Dglamor=true -Dxwayland_ei=false' ./scripts/xwayland/build_patched_xwayland.sh
-
-# if libtirpc-dev is installed and desired
-XSERVER_SECURE_RPC=true ./scripts/xwayland/build_patched_xwayland.sh
-
-# auto-install build deps (apt only)
-XSERVER_INSTALL_BUILD_DEPS=1 ./scripts/xwayland/build_patched_xwayland.sh
-
-# install patched binary into /usr/bin/Xwayland (backs up to /usr/bin/Xwayland.orig once)
-XSERVER_INSTALL_SYSTEM=1 ./scripts/xwayland/build_patched_xwayland.sh
-
-# install system-wide and reboot automatically at the end
-XSERVER_INSTALL_SYSTEM=1 XSERVER_REBOOT_AFTER_INSTALL=1 ./scripts/xwayland/build_patched_xwayland.sh
-
-# override persistent bridge env behavior/path when system install is enabled
-XSERVER_INSTALL_SYSTEM=1 XSERVER_CONFIGURE_BRIDGE_ENV=0 ./scripts/xwayland/build_patched_xwayland.sh
-XSERVER_INSTALL_SYSTEM=1 XSERVER_BRIDGE_SOCKET_PATH=/run/user/$(id -u)/xwl-dmabuf.sock ./scripts/xwayland/build_patched_xwayland.sh
-XSERVER_INSTALL_SYSTEM=1 XSERVER_BRIDGE_ENV_FILE="$HOME/.config/environment.d/90-xwl-bridge.conf" ./scripts/xwayland/build_patched_xwayland.sh
+XSERVER_INSTALL_SYSTEM=1 \
+./scripts/xwayland/build_patched_xwayland.sh
 ```
 
-System install/reboot options are always opt-in:
+By default this:
 
-- `XSERVER_INSTALL_SYSTEM=1`: install `${PREFIX_DIR}/bin/Xwayland` to `/usr/bin/Xwayland`
-- `XSERVER_SYSTEM_XWAYLAND_PATH=/path/to/Xwayland`: override install destination
-- `XSERVER_SYSTEM_XWAYLAND_BACKUP_PATH=/path/to/backup`: override backup path
-- `XSERVER_CONFIGURE_BRIDGE_ENV=1` (default with system install): write persistent `XWL_DMABUF_BRIDGE` env file
-- `XSERVER_BRIDGE_SOCKET_PATH=/run/user/<uid>/xwl-dmabuf.sock`: socket path written to env file
-- `XSERVER_BRIDGE_ENV_FILE=~/.config/environment.d/90-xwl-bridge.conf`: persistent env file path
-- `XSERVER_REBOOT_AFTER_INSTALL=1`: reboot after build/install
+- copies the existing `/usr/bin/Xwayland` to `/usr/bin/Xwayland.orig` if that
+  backup does not already exist;
+- installs the patched binary as `/usr/bin/Xwayland`;
+- writes `XWL_DMABUF_BRIDGE` to
+  `~/.config/environment.d/90-xwl-bridge.conf`;
+- leaves reboot disabled.
 
-## Use patched Xwayland in session
+The default socket is:
 
-GNOME/mutter launches `/usr/bin/Xwayland` directly, so install/rollback is typically:
+```text
+/run/user/<uid>/xwl-dmabuf.sock
+```
+
+Log out and back in after installation. Both the newly launched Xwayland
+process and games started in that session need the same
+`XWL_DMABUF_BRIDGE` value.
+
+To install the patched binary without enabling the private bridge:
 
 ```bash
-sudo cp /usr/bin/Xwayland /usr/bin/Xwayland.orig
-sudo install -m 0755 third_party/xserver/_install-bridge/bin/Xwayland /usr/bin/Xwayland
+XSERVER_INSTALL_SYSTEM=1 \
+XSERVER_CONFIGURE_BRIDGE_ENV=0 \
+./scripts/xwayland/build_patched_xwayland.sh
 ```
 
-Log out and log back in.
+That keeps the DRI3 fixes while leaving the bridge socket disabled.
 
-To roll back:
+## Force the bridge
+
+When the environment is not persisted by the helper, export the socket path in
+the session before Xwayland and the game start:
 
 ```bash
-sudo install -m 0755 /usr/bin/Xwayland.orig /usr/bin/Xwayland
+export XWL_DMABUF_BRIDGE=/run/user/"$(id -u)"/xwl-dmabuf.sock
 ```
 
-## Bridge runtime configuration
-
-The patch adds an optional UNIX socket bridge enabled by:
+The wrapper still prefers DRI3 unless the bridge is forced:
 
 ```bash
-export XWL_DMABUF_BRIDGE=/run/user/$(id -u)/xwl-dmabuf.sock
+XWL_DMABUF_BRIDGE=/run/user/"$(id -u)"/xwl-dmabuf.sock \
+WSI_X11_FORCE_BRIDGE=1 \
+your-game
 ```
 
-When `XSERVER_INSTALL_SYSTEM=1`, the helper script now configures this automatically by default via:
+If the socket is missing or cannot be connected during swapchain creation, the
+wrapper continues to DRI3 and then SHM.
 
-- `~/.config/environment.d/90-xwl-bridge.conf`
+## Bridge controls
 
-You still need to log out and log back in so the next Xwayland process inherits it.
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK` | `0` | Wait for a frame acknowledgment when the server reports support |
+| `XWL_DMABUF_BRIDGE_FEEDBACK_TIMEOUT_MS` | `250` | Feedback wait timeout, capped at 5000 ms |
+| `XWL_DMABUF_BRIDGE_MAX_FPS` | Unset | Optional timer cap from 0 to 240 FPS |
+| `XWL_DMABUF_BRIDGE_PREFER_LINEAR` | `0` | Prefer `DRM_FORMAT_MOD_LINEAR` when importable |
+| `XWL_DMABUF_BRIDGE_RESERVED_FREE_IMAGES` | Automatic | Keep one image free, or two with `liblsfg-vk` loaded |
+| `WSI_ALLOW_NON_FIFO_PRESENT_MODE` | `0` | Keep requested MAILBOX/IMMEDIATE mode instead of forcing FIFO |
 
-The socket ABI and packet format are documented in:
+Timer pacing is disabled when `XWL_DMABUF_BRIDGE_MAX_FPS` is unset or `0`.
+Feedback is probed even in non-blocking mode; per-frame waits happen only when
+explicitly enabled and supported by the patched server.
 
-- `third_party/xserver/hw/xwayland/DMABUF_BRIDGE.md` (generated when patch is applied)
-
-## Wrapper integration status
-
-Implemented in this repo:
-
-1. X11 swapchain bridge client (`AF_UNIX`, `SOCK_SEQPACKET`) that sends packet + dmabuf FDs via `sendmsg(..., SCM_RIGHTS, ...)`.
-2. X11 swapchain dmabuf image allocation/binding path for bridge mode.
-3. Legacy SDL helper-window routing is now opt-in only (`WSI_FORCE_SDL_WAYLAND=1`).
-4. Existing SHM presenter path remains available when `XWL_DMABUF_BRIDGE` is unset.
-
-Runtime behavior:
-
-- `WSI_X11_FORCE_BRIDGE=1` plus `XWL_DMABUF_BRIDGE` set: force the Xwayland dmabuf bridge path for X11 swapchains.
-- `XWL_DMABUF_BRIDGE_PREFER_LINEAR=1`: prefer `DRM_FORMAT_MOD_LINEAR` (default behavior now prefers non-linear modifiers when available).
-- `XWL_DMABUF_BRIDGE_MAX_FPS=<N>`: cap bridge present rate (`0` disables timer pacing, and timer pacing is disabled by default unless this override is set).
-- `XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK=1`: block on per-frame bridge ACK feedback after probing server support. This is now opt-in; default behavior keeps feedback probing non-blocking.
-- `XWL_DMABUF_BRIDGE_FEEDBACK_TIMEOUT_MS=<N>`: timeout for blocking ACK-based frame feedback (default `250` ms) when `XWL_DMABUF_BRIDGE_WAIT_FOR_FEEDBACK=1`.
-- `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`: keep the app-selected present mode (MAILBOX/IMMEDIATE/etc.) on X11 dmabuf presentation paths. Non-FIFO modes are forced back to FIFO by default for stability, and this opt-in may flicker on patched Xwayland/Mali.
-- `XWL_DMABUF_BRIDGE_ALLOW_MAILBOX=1`: legacy alias for bridge-specific setups (deprecated; prefer `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`).
-- `XWL_DMABUF_BRIDGE` unset: use existing SHM presenter path.
-- `WSI_FORCE_SDL_WAYLAND=1`: force legacy SDL workaround path (for fallback testing only).
+`XWL_DMABUF_BRIDGE_ALLOW_MAILBOX` is a deprecated bridge-only alias for
+`WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`.
 
 ## Troubleshooting
 
-- Bridge socket present but no frames:
-  - `journalctl -b --no-pager | grep -E "xwayland dmabuf bridge|XWAYLAND:"`
-- Import failures now log non-fatal diagnostics from patched Xwayland, for example:
-  - `xwayland dmabuf bridge: compositor rejected dmabuf xid=... format=... modifier=... planes=... p0_offset=... p0_stride=...`
-  - `xwayland dmabuf bridge: failed to commit created buffer xid=... format=... modifier=...`
-- The bridge now uses `zwp_linux_buffer_params_v1_create()` (non-fatal import path), so a bad frame should not terminate Xwayland.
-- With the updated Xwayland patch series, the bridge includes ACK-based feedback (`HELLO`/`FEEDBACK`) and the wrapper enforces timer-capped pacing in bridge mode.
-  - ACK success is emitted on `wl_surface.frame` callback (present cadence signal).
-  - Wrapper log when active: `Xwayland bridge: sync feedback active; enforcing timer cap as an additional bridge safety bound.`
-  - Wrapper fallback log (old Xwayland): `Xwayland bridge: sync feedback unsupported by server, using fallback pacing`
-- If explicit linear import fails (`modifier=0x0`), patched Xwayland retries once with implicit modifier semantics (`DRM_FORMAT_MOD_INVALID`) and logs:
-  - `xwayland dmabuf bridge: retrying linear import with implicit modifier ...`
+Enable detailed WSI logs:
+
+```bash
+MALI_WRAPPER_LOG_LEVEL=3 \
+MALI_WRAPPER_LOG_CATEGORY=wsi \
+MALI_WRAPPER_LOG_FILE=/tmp/mali-wrapper-bridge.log \
+your-game
+```
+
+Useful checks:
+
+```bash
+test -S /run/user/"$(id -u)"/xwl-dmabuf.sock
+journalctl -b --no-pager | grep -E 'xwayland dmabuf bridge|XWAYLAND:'
+```
+
+The wrapper log reports connection failure, feedback support, chosen formats
+and modifiers, pacing, frame submission failures, and any switch away from the
+bridge after a runtime failure.
+
+Force SHM to confirm the failure is in a DMA-BUF path:
+
+```bash
+WSI_X11_FORCE_SHM=1 your-game
+```
+
+The general DRI3-first selection rules are in
+[X11 presentation](x11-presentation.md).
+
+## Roll back
+
+If the helper created the default backup:
+
+```bash
+sudo install -m 0755 /usr/bin/Xwayland.orig /usr/bin/Xwayland
+rm -f "$HOME/.config/environment.d/90-xwl-bridge.conf"
+```
+
+Log out and back in after restoring Xwayland. Remove or unset
+`XWL_DMABUF_BRIDGE` from any other session configuration as well.

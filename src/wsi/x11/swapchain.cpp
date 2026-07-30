@@ -1526,7 +1526,13 @@ bool swapchain::free_image_found()
       assert(pixmap.has_value());
       for (size_t i = 0; i < m_swapchain_images.size(); i++)
       {
-         auto data = reinterpret_cast<x11_image_data *>(m_swapchain_images[i].data);
+         auto &image = m_swapchain_images[i];
+         if (image.status == swapchain_image::INVALID || image.data == nullptr)
+         {
+            continue;
+         }
+
+         auto data = reinterpret_cast<x11_image_data *>(image.data);
          if (data->pixmap == pixmap.value())
          {
             unpresent_image(i);
