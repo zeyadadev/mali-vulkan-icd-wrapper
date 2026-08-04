@@ -14,7 +14,7 @@ MALI_G29_64_LATEST_DEB_URL="${MALI_G29_64_LATEST_DEB_URL:-https://github.com/gin
 MALI_G29_64_DEB_URL="${MALI_G29_64_DEB_URL:-}"
 MALI_G29_64_EXTRACT_DIR="${MALI_G29_64_EXTRACT_DIR:-/opt/mali-g29p1}"
 MALI_G29_CLEAN_EXTRACT="${MALI_G29_CLEAN_EXTRACT:-true}"
-MALI_32_BLOB_URL="${MALI_32_BLOB_URL:-https://github.com/ginkage/libmali-rockchip/raw/refs/heads/master/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so}"
+MALI_32_BLOB_URL="${MALI_32_BLOB_URL:-https://raw.githubusercontent.com/ginkage/libmali-rockchip/04f8711/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so}"
 MALI_32_TARGET="${MALI_32_TARGET:-/usr/lib/arm-linux-gnueabihf/libmali-valhall-g610-g24p0-wayland-gbm.so}"
 MALI_32_SYMLINK="${MALI_32_SYMLINK:-/usr/lib/arm-linux-gnueabihf/libmali.so}"
 
