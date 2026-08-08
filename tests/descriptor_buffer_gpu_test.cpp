@@ -1,10 +1,17 @@
 #include <vulkan/vulkan.h>
 
 #include "descriptor_fixed_array_comp_spv.hpp"
+#include "descriptor_graphics_frag_spv.hpp"
+#include "descriptor_graphics_vert_spv.hpp"
+#include "descriptor_texel_graphics_frag_spv.hpp"
+#include "descriptor_texel_graphics_vert_spv.hpp"
 #include "descriptor_image_comp_spv.hpp"
 #include "descriptor_mutable_comp_spv.hpp"
+#include "descriptor_sampler_array_comp_spv.hpp"
 #include "descriptor_storage_comp_spv.hpp"
 #include "descriptor_uniform_array_comp_spv.hpp"
+#include "descriptor_uniform_buffer_comp_spv.hpp"
+#include "descriptor_vkd3d_array_comp_spv.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +28,7 @@
 namespace {
 
 constexpr uint32_t kStorageExpected = 0x13579bdfu;
+constexpr uint32_t kUniformExpected = 0x2468ace0u;
 constexpr uint32_t kImageExpected = 0xffbf8040u;
 
 void check(VkResult result, const char* operation)
@@ -194,6 +202,8 @@ struct DescriptorObjects {
     std::vector<VkDescriptorSetLayout> set_layouts;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 
     DescriptorObjects() = default;
@@ -213,11 +223,15 @@ struct DescriptorObjects {
             set_layouts = std::move(other.set_layouts);
             pipeline_layout = other.pipeline_layout;
             pipeline = other.pipeline;
+            render_pass = other.render_pass;
+            framebuffer = other.framebuffer;
             descriptor_pool = other.descriptor_pool;
             other.device = VK_NULL_HANDLE;
             other.set_layouts.clear();
             other.pipeline_layout = VK_NULL_HANDLE;
             other.pipeline = VK_NULL_HANDLE;
+            other.render_pass = VK_NULL_HANDLE;
+            other.framebuffer = VK_NULL_HANDLE;
             other.descriptor_pool = VK_NULL_HANDLE;
         }
         return *this;
@@ -236,8 +250,14 @@ struct DescriptorObjects {
         if (descriptor_pool != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         }
+        if (framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, pipeline, nullptr);
+        }
+        if (render_pass != VK_NULL_HANDLE) {
+            vkDestroyRenderPass(device, render_pass, nullptr);
         }
         if (pipeline_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
@@ -249,6 +269,8 @@ struct DescriptorObjects {
         set_layouts.clear();
         pipeline_layout = VK_NULL_HANDLE;
         pipeline = VK_NULL_HANDLE;
+        render_pass = VK_NULL_HANDLE;
+        framebuffer = VK_NULL_HANDLE;
         descriptor_pool = VK_NULL_HANDLE;
     }
 };
@@ -437,10 +459,55 @@ public:
             to_shader.subresourceRange = range;
             vkCmdPipelineBarrier(command_buffer,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &to_shader);
         });
 
+        return result;
+    }
+
+    Image create_render_target()
+    {
+        Image result;
+        result.device = device_;
+
+        VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image_info.extent = {1, 1, 1};
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(device_, &image_info, nullptr, &result.image),
+              "vkCreateImage(render target)");
+
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(device_, result.image, &requirements);
+        VkMemoryAllocateInfo allocate_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate_info.allocationSize = requirements.size;
+        allocate_info.memoryTypeIndex =
+            find_memory_type(requirements.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(device_, &allocate_info, nullptr, &result.memory),
+              "vkAllocateMemory(render target)");
+        check(vkBindImageMemory(device_, result.image, result.memory, 0),
+              "vkBindImageMemory(render target)");
+
+        VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_info.image = result.image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = 1;
+        check(vkCreateImageView(device_, &view_info, nullptr, &result.view),
+              "vkCreateImageView(render target)");
         return result;
     }
 
@@ -508,6 +575,7 @@ public:
     PFN_vkGetDescriptorSetLayoutBindingOffsetEXT get_binding_offset = nullptr;
     PFN_vkCmdBindDescriptorBuffersEXT cmd_bind_descriptor_buffers = nullptr;
     PFN_vkCmdSetDescriptorBufferOffsetsEXT cmd_set_descriptor_offsets = nullptr;
+    PFN_vkCmdPushDescriptorSetKHR cmd_push_descriptor_set = nullptr;
 
 private:
     void create()
@@ -552,6 +620,11 @@ private:
             throw std::runtime_error(
                 "VK_EXT_mutable_descriptor_type is not advertised");
         }
+        if (!has_extension(physical_device_,
+                           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
+            throw std::runtime_error(
+                "VK_KHR_push_descriptor is not advertised");
+        }
 
         VkPhysicalDeviceVulkan12Features vulkan_1_2_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -577,6 +650,10 @@ private:
             throw std::runtime_error(
                 "descriptorBuffer feature is not supported");
         }
+        if (!descriptor_features.descriptorBufferPushDescriptors) {
+            throw std::runtime_error(
+                "descriptorBufferPushDescriptors is not supported");
+        }
         if (!mutable_features.mutableDescriptorType) {
             throw std::runtime_error(
                 "mutableDescriptorType feature is not supported");
@@ -598,6 +675,12 @@ private:
             << " sampled-image="
             << descriptor_properties_.sampledImageDescriptorSize
             << " sampler=" << descriptor_properties_.samplerDescriptorSize
+            << " push-descriptors="
+            << (descriptor_features.descriptorBufferPushDescriptors
+                    ? "yes" : "no")
+            << " bufferless-push="
+            << (descriptor_properties_.bufferlessPushDescriptors
+                    ? "yes" : "no")
             << " max-bindings="
             << descriptor_properties_.maxDescriptorBufferBindings << '\n';
 
@@ -608,19 +691,22 @@ private:
         vkGetPhysicalDeviceQueueFamilyProperties(
             physical_device_, &queue_family_count, queue_families.data());
         for (uint32_t i = 0; i < queue_family_count; ++i) {
-            if ((queue_families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+            const VkQueueFlags required =
+                VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT;
+            if ((queue_families[i].queueFlags & required) == required) {
                 queue_family_ = i;
                 break;
             }
         }
         if (queue_family_ == UINT32_MAX) {
-            throw std::runtime_error("No compute-capable queue family found");
+            throw std::runtime_error(
+                "No graphics-and-compute-capable queue family found");
         }
 
         descriptor_features.descriptorBuffer = VK_TRUE;
         descriptor_features.descriptorBufferCaptureReplay = VK_FALSE;
         descriptor_features.descriptorBufferImageLayoutIgnored = VK_FALSE;
-        descriptor_features.descriptorBufferPushDescriptors = VK_FALSE;
+        descriptor_features.descriptorBufferPushDescriptors = VK_TRUE;
         mutable_features.mutableDescriptorType = VK_TRUE;
         vulkan_1_2_features.bufferDeviceAddress = VK_TRUE;
         vulkan_1_2_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
@@ -639,12 +725,14 @@ private:
         const char* extensions[] = {
             VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
             VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME,
+            VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         };
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         device_info.pNext = &descriptor_features;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
-        device_info.enabledExtensionCount = 2;
+        device_info.enabledExtensionCount =
+            static_cast<uint32_t>(std::size(extensions));
         device_info.ppEnabledExtensionNames = extensions;
         check(vkCreateDevice(physical_device_, &device_info, nullptr, &device_),
               "vkCreateDevice");
@@ -678,8 +766,12 @@ private:
             reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsetsEXT>(
                 vkGetDeviceProcAddr(
                     device_, "vkCmdSetDescriptorBufferOffsetsEXT"));
+        cmd_push_descriptor_set =
+            reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
+                vkGetDeviceProcAddr(device_, "vkCmdPushDescriptorSetKHR"));
         if (!get_descriptor || !get_layout_size || !get_binding_offset ||
-            !cmd_bind_descriptor_buffers || !cmd_set_descriptor_offsets) {
+            !cmd_bind_descriptor_buffers || !cmd_set_descriptor_offsets ||
+            !cmd_push_descriptor_set) {
             throw std::runtime_error(
                 "One or more descriptor-buffer entry points are null");
         }
@@ -791,6 +883,151 @@ DescriptorObjects create_compute_objects(
                                  &pipeline_info, nullptr, &objects.pipeline);
     vkDestroyShaderModule(context.device(), shader, nullptr);
     check(pipeline_result, "vkCreateComputePipelines");
+    return objects;
+}
+
+DescriptorObjects create_graphics_objects(
+    Context& context,
+    std::vector<VkDescriptorSetLayout> set_layouts,
+    const Image& render_target,
+    const uint32_t* vertex_shader_code = descriptor_graphics_vert_spv,
+    size_t vertex_shader_size = sizeof(descriptor_graphics_vert_spv),
+    const uint32_t* fragment_shader_code = descriptor_graphics_frag_spv,
+    size_t fragment_shader_size = sizeof(descriptor_graphics_frag_spv),
+    VkShaderStageFlags push_constant_stages = VK_SHADER_STAGE_FRAGMENT_BIT,
+    uint32_t push_constant_size = sizeof(uint32_t))
+{
+    DescriptorObjects objects;
+    objects.device = context.device();
+    objects.set_layouts = std::move(set_layouts);
+
+    VkPushConstantRange push_constant_range{};
+    push_constant_range.stageFlags = push_constant_stages;
+    push_constant_range.size = push_constant_size;
+    VkPipelineLayoutCreateInfo layout_info{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.setLayoutCount =
+        static_cast<uint32_t>(objects.set_layouts.size());
+    layout_info.pSetLayouts = objects.set_layouts.data();
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_constant_range;
+    check(vkCreatePipelineLayout(context.device(), &layout_info, nullptr,
+                                 &objects.pipeline_layout),
+          "vkCreatePipelineLayout(graphics)");
+
+    VkAttachmentDescription attachment{};
+    attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference color_reference{
+        0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_reference;
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo render_pass_info{
+        VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    render_pass_info.attachmentCount = 1;
+    render_pass_info.pAttachments = &attachment;
+    render_pass_info.subpassCount = 1;
+    render_pass_info.pSubpasses = &subpass;
+    render_pass_info.dependencyCount = 1;
+    render_pass_info.pDependencies = &dependency;
+    check(vkCreateRenderPass(context.device(), &render_pass_info, nullptr,
+                             &objects.render_pass),
+          "vkCreateRenderPass");
+
+    VkFramebufferCreateInfo framebuffer_info{
+        VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    framebuffer_info.renderPass = objects.render_pass;
+    framebuffer_info.attachmentCount = 1;
+    framebuffer_info.pAttachments = &render_target.view;
+    framebuffer_info.width = 1;
+    framebuffer_info.height = 1;
+    framebuffer_info.layers = 1;
+    check(vkCreateFramebuffer(context.device(), &framebuffer_info, nullptr,
+                              &objects.framebuffer),
+          "vkCreateFramebuffer");
+
+    const std::array<VkShaderModule, 2> modules{{
+        create_shader_module(context.device(), vertex_shader_code,
+                             vertex_shader_size),
+        create_shader_module(context.device(), fragment_shader_code,
+                             fragment_shader_size),
+    }};
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = modules[0];
+    stages[0].pName = "main";
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = modules[1];
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vertex_input{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo input_assembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkViewport viewport{0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+    VkRect2D scissor{{0, 0}, {1, 1}};
+    VkPipelineViewportStateCreateInfo viewport_state{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport_state.viewportCount = 1;
+    viewport_state.pViewports = &viewport;
+    viewport_state.scissorCount = 1;
+    viewport_state.pScissors = &scissor;
+    VkPipelineRasterizationStateCreateInfo rasterization{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterization.cullMode = VK_CULL_MODE_NONE;
+    rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterization.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blend{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blend_attachment;
+
+    VkGraphicsPipelineCreateInfo pipeline_info{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipeline_info.flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    pipeline_info.stageCount = static_cast<uint32_t>(stages.size());
+    pipeline_info.pStages = stages.data();
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &rasterization;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pColorBlendState = &blend;
+    pipeline_info.layout = objects.pipeline_layout;
+    pipeline_info.renderPass = objects.render_pass;
+    pipeline_info.subpass = 0;
+    const VkResult pipeline_result = vkCreateGraphicsPipelines(
+        context.device(), VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
+        &objects.pipeline);
+    for (VkShaderModule module : modules) {
+        vkDestroyShaderModule(context.device(), module, nullptr);
+    }
+    check(pipeline_result, "vkCreateGraphicsPipelines");
     return objects;
 }
 
@@ -975,6 +1212,231 @@ bool test_storage_descriptor_buffer(Context& context, Buffer& output)
         add_compute_to_host_barrier(command_buffer, output.buffer);
     });
     return report_result("descriptor-buffer storage buffer",
+                         read_output(context, output), kStorageExpected);
+}
+
+bool test_uniform_buffer(Context& context, Buffer& output,
+                         bool descriptor_buffer)
+{
+    const std::vector<VkDescriptorSetLayoutBinding> bindings{
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+         VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+         VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    };
+    std::vector<VkDescriptorSetLayout> layouts{
+        create_set_layout(context.device(), bindings, descriptor_buffer),
+    };
+    DescriptorObjects objects = create_compute_objects(
+        context, std::move(layouts), descriptor_uniform_buffer_comp_spv,
+        sizeof(descriptor_uniform_buffer_comp_spv), descriptor_buffer);
+
+    Buffer input = context.create_buffer(
+        16,
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    std::memset(input.mapped, 0, 16);
+    std::memcpy(input.mapped, &kUniformExpected, sizeof(kUniformExpected));
+    context.flush(input);
+
+    reset_output(context, output);
+    if (!descriptor_buffer) {
+        const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+        }};
+        VkDescriptorPoolCreateInfo pool_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pool_info.maxSets = 1;
+        pool_info.poolSizeCount =
+            static_cast<uint32_t>(pool_sizes.size());
+        pool_info.pPoolSizes = pool_sizes.data();
+        check(vkCreateDescriptorPool(context.device(), &pool_info, nullptr,
+                                     &objects.descriptor_pool),
+              "vkCreateDescriptorPool(uniform)");
+
+        VkDescriptorSetAllocateInfo allocate_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate_info.descriptorPool = objects.descriptor_pool;
+        allocate_info.descriptorSetCount = 1;
+        allocate_info.pSetLayouts = objects.set_layouts.data();
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        check(vkAllocateDescriptorSets(context.device(), &allocate_info, &set),
+              "vkAllocateDescriptorSets(uniform)");
+
+        VkDescriptorBufferInfo input_info{input.buffer, 0, 16};
+        VkDescriptorBufferInfo output_info{
+            output.buffer, 0, sizeof(uint32_t)};
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[0].dstSet = set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &input_info;
+        writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[1].dstSet = set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &output_info;
+        vkUpdateDescriptorSets(context.device(),
+                               static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+
+        context.submit([&](VkCommandBuffer command_buffer) {
+            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              objects.pipeline);
+            vkCmdBindDescriptorSets(
+                command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                objects.pipeline_layout, 0, 1, &set, 0, nullptr);
+            vkCmdDispatch(command_buffer, 1, 1, 1);
+            add_compute_to_host_barrier(command_buffer, output.buffer);
+        });
+    } else {
+        const auto& properties = context.descriptor_properties();
+        VkDeviceSize layout_size = 0;
+        VkDeviceSize uniform_offset = 0;
+        VkDeviceSize storage_offset = 0;
+        context.get_layout_size(context.device(), objects.set_layouts[0],
+                                &layout_size);
+        context.get_binding_offset(context.device(), objects.set_layouts[0],
+                                   0, &uniform_offset);
+        context.get_binding_offset(context.device(), objects.set_layouts[0],
+                                   1, &storage_offset);
+        const VkDeviceSize allocation_size = align_up(
+            std::max({layout_size,
+                      uniform_offset +
+                          properties.uniformBufferDescriptorSize,
+                      storage_offset +
+                          properties.storageBufferDescriptorSize}),
+            properties.descriptorBufferOffsetAlignment);
+        Buffer descriptors = context.create_buffer(
+            allocation_size,
+            VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+        std::memset(descriptors.mapped, 0,
+                    static_cast<size_t>(allocation_size));
+
+        VkDescriptorAddressInfoEXT input_address{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+        input_address.address = input.address;
+        input_address.range = 16;
+        input_address.format = VK_FORMAT_UNDEFINED;
+        VkDescriptorGetInfoEXT uniform_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+        uniform_info.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        uniform_info.data.pUniformBuffer = &input_address;
+        context.get_descriptor(
+            context.device(), &uniform_info,
+            properties.uniformBufferDescriptorSize,
+            static_cast<uint8_t*>(descriptors.mapped) + uniform_offset);
+
+        VkDescriptorAddressInfoEXT output_address{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+        output_address.address = output.address;
+        output_address.range = sizeof(uint32_t);
+        output_address.format = VK_FORMAT_UNDEFINED;
+        VkDescriptorGetInfoEXT storage_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+        storage_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        storage_info.data.pStorageBuffer = &output_address;
+        context.get_descriptor(
+            context.device(), &storage_info,
+            properties.storageBufferDescriptorSize,
+            static_cast<uint8_t*>(descriptors.mapped) + storage_offset);
+        context.flush(descriptors);
+
+        context.submit([&](VkCommandBuffer command_buffer) {
+            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              objects.pipeline);
+            VkDescriptorBufferBindingInfoEXT binding{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT};
+            binding.address = descriptors.address;
+            binding.usage =
+                VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
+            context.cmd_bind_descriptor_buffers(command_buffer, 1, &binding);
+            const uint32_t buffer_index = 0;
+            const VkDeviceSize offset = 0;
+            context.cmd_set_descriptor_offsets(
+                command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                objects.pipeline_layout, 0, 1, &buffer_index, &offset);
+            vkCmdDispatch(command_buffer, 1, 1, 1);
+            add_compute_to_host_barrier(command_buffer, output.buffer);
+        });
+    }
+
+    return report_result(
+        descriptor_buffer ? "descriptor-buffer uniform buffer"
+                          : "descriptor-set uniform buffer",
+        read_output(context, output), kUniformExpected);
+}
+
+bool test_descriptor_buffer_push_descriptor(Context& context, Buffer& output)
+{
+    const VkDescriptorSetLayoutBinding binding{
+        0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr,
+    };
+    VkDescriptorSetLayoutCreateInfo layout_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layout_info.flags =
+        VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR |
+        VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    layout_info.bindingCount = 1;
+    layout_info.pBindings = &binding;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    check(vkCreateDescriptorSetLayout(context.device(), &layout_info, nullptr,
+                                      &layout),
+          "vkCreateDescriptorSetLayout(push descriptor buffer)");
+
+    DescriptorObjects objects = create_compute_objects(
+        context, {layout}, descriptor_storage_comp_spv,
+        sizeof(descriptor_storage_comp_spv), true);
+
+    Buffer push_descriptor_backing = context.create_buffer(
+        4096,
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    std::memset(push_descriptor_backing.mapped, 0,
+                static_cast<size_t>(push_descriptor_backing.size));
+    context.flush(push_descriptor_backing);
+
+    VkDescriptorBufferInfo output_info{
+        output.buffer, 0, sizeof(uint32_t)};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &output_info;
+
+    VkDescriptorBufferBindingPushDescriptorBufferHandleEXT push_handle{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_PUSH_DESCRIPTOR_BUFFER_HANDLE_EXT};
+    push_handle.buffer = push_descriptor_backing.buffer;
+    VkDescriptorBufferBindingInfoEXT binding_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT};
+    binding_info.pNext = &push_handle;
+    binding_info.address = push_descriptor_backing.address;
+    binding_info.usage =
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+        VK_BUFFER_USAGE_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT;
+
+    reset_output(context, output);
+    context.submit([&](VkCommandBuffer command_buffer) {
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          objects.pipeline);
+        context.cmd_bind_descriptor_buffers(command_buffer, 1, &binding_info);
+        context.cmd_push_descriptor_set(
+            command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            objects.pipeline_layout, 0, 1, &write);
+        vkCmdDispatch(command_buffer, 1, 1, 1);
+        add_compute_to_host_barrier(command_buffer, output.buffer);
+    });
+    return report_result("descriptor-buffer backed push descriptor",
                          read_output(context, output), kStorageExpected);
 }
 
@@ -1233,33 +1695,49 @@ VkDescriptorSetLayout create_sampled_array_layout(Context& context,
                                                   bool descriptor_buffer,
                                                   bool mutable_descriptor,
                                                   uint32_t descriptor_count,
-                                                  bool variable_descriptor_count)
+                                                  bool variable_descriptor_count,
+                                                  bool vkd3d_aux_binding)
 {
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = mutable_descriptor
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    if (vkd3d_aux_binding) {
+        VkDescriptorSetLayoutBinding aux_binding{};
+        aux_binding.binding = 0;
+        aux_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        aux_binding.descriptorCount = 1;
+        aux_binding.stageFlags = VK_SHADER_STAGE_ALL;
+        bindings.push_back(aux_binding);
+    }
+
+    VkDescriptorSetLayoutBinding array_binding{};
+    array_binding.binding = vkd3d_aux_binding ? 1 : 0;
+    array_binding.descriptorType = mutable_descriptor
         ? VK_DESCRIPTOR_TYPE_MUTABLE_EXT
         : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    binding.descriptorCount = descriptor_count;
-    binding.stageFlags = VK_SHADER_STAGE_ALL;
+    array_binding.descriptorCount = descriptor_count;
+    array_binding.stageFlags = VK_SHADER_STAGE_ALL;
+    bindings.push_back(array_binding);
 
-    VkDescriptorBindingFlags binding_flags = variable_descriptor_count
-        ? VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT
-        : 0;
-    VkMutableDescriptorTypeListEXT mutable_list{};
-    mutable_list.descriptorTypeCount =
+    std::vector<VkDescriptorBindingFlags> binding_flags(bindings.size(), 0);
+    if (variable_descriptor_count) {
+        binding_flags.back() =
+            VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+    }
+    std::vector<VkMutableDescriptorTypeListEXT> mutable_lists(bindings.size());
+    mutable_lists.back().descriptorTypeCount =
         static_cast<uint32_t>(kMutableTypes.size());
-    mutable_list.pDescriptorTypes = kMutableTypes.data();
+    mutable_lists.back().pDescriptorTypes = kMutableTypes.data();
     VkMutableDescriptorTypeCreateInfoEXT mutable_info{
         VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT};
-    mutable_info.mutableDescriptorTypeListCount = 1;
-    mutable_info.pMutableDescriptorTypeLists = &mutable_list;
+    mutable_info.mutableDescriptorTypeListCount =
+        static_cast<uint32_t>(mutable_lists.size());
+    mutable_info.pMutableDescriptorTypeLists = mutable_lists.data();
     VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     binding_flags_info.pNext =
         mutable_descriptor ? &mutable_info : nullptr;
-    binding_flags_info.bindingCount = 1;
-    binding_flags_info.pBindingFlags = &binding_flags;
+    binding_flags_info.bindingCount =
+        static_cast<uint32_t>(binding_flags.size());
+    binding_flags_info.pBindingFlags = binding_flags.data();
 
     VkDescriptorSetLayoutCreateInfo create_info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -1267,8 +1745,8 @@ VkDescriptorSetLayout create_sampled_array_layout(Context& context,
     create_info.flags = descriptor_buffer
         ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT
         : 0;
-    create_info.bindingCount = 1;
-    create_info.pBindings = &binding;
+    create_info.bindingCount = static_cast<uint32_t>(bindings.size());
+    create_info.pBindings = bindings.data();
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     check(vkCreateDescriptorSetLayout(context.device(), &create_info,
                                       nullptr, &layout),
@@ -1280,7 +1758,8 @@ std::vector<VkDescriptorSetLayout> create_mutable_test_layouts(
     Context& context, bool descriptor_buffer,
     bool mutable_descriptor = true,
     uint32_t descriptor_count = kMutableDescriptorCount,
-    bool variable_descriptor_count = true)
+    bool variable_descriptor_count = true,
+    bool vkd3d_aux_binding = false)
 {
     const std::vector<VkDescriptorSetLayoutBinding> sampler_bindings{{
         0, VK_DESCRIPTOR_TYPE_SAMPLER, 1,
@@ -1293,7 +1772,8 @@ std::vector<VkDescriptorSetLayout> create_mutable_test_layouts(
     return {
         create_sampled_array_layout(context, descriptor_buffer,
                                     mutable_descriptor, descriptor_count,
-                                    variable_descriptor_count),
+                                    variable_descriptor_count,
+                                    vkd3d_aux_binding),
         create_set_layout(context.device(), sampler_bindings,
                           descriptor_buffer),
         create_set_layout(context.device(), storage_bindings,
@@ -1425,12 +1905,13 @@ bool test_sampled_array_descriptor_buffer(
     uint32_t descriptor_index, VkDeviceSize requested_base_offset,
     const uint32_t* shader_code, size_t shader_size,
     const char* indexing_name,
-    bool variable_descriptor_count = true)
+    bool variable_descriptor_count = true,
+    bool vkd3d_aux_binding = false)
 {
     DescriptorObjects objects = create_compute_objects(
         context, create_mutable_test_layouts(
                      context, true, mutable_descriptor, descriptor_count,
-                     variable_descriptor_count),
+                     variable_descriptor_count, vkd3d_aux_binding),
         shader_code, shader_size,
         true, sizeof(uint32_t));
     const auto& properties = context.descriptor_properties();
@@ -1439,11 +1920,18 @@ bool test_sampled_array_descriptor_buffer(
 
     std::array<VkDeviceSize, 3> layout_sizes{};
     std::array<VkDeviceSize, 3> binding_offsets{};
+    const uint32_t resource_array_binding = vkd3d_aux_binding ? 1 : 0;
     for (size_t i = 0; i < objects.set_layouts.size(); ++i) {
         context.get_layout_size(context.device(), objects.set_layouts[i],
                                 &layout_sizes[i]);
         context.get_binding_offset(context.device(), objects.set_layouts[i],
-                                   0, &binding_offsets[i]);
+                                   i == 0 ? resource_array_binding : 0,
+                                   &binding_offsets[i]);
+    }
+    VkDeviceSize aux_binding_offset = 0;
+    if (vkd3d_aux_binding) {
+        context.get_binding_offset(context.device(), objects.set_layouts[0],
+                                   0, &aux_binding_offset);
     }
 
     const std::array<VkDeviceSize, 3> base_offsets{{
@@ -1480,7 +1968,8 @@ bool test_sampled_array_descriptor_buffer(
     Buffer resource_descriptors = context.create_buffer(
         resource_size,
         VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
     Buffer sampler_descriptors = context.create_buffer(
         sampler_size,
@@ -1492,12 +1981,19 @@ bool test_sampled_array_descriptor_buffer(
         VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    Buffer aux_value = context.create_buffer(
+        sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
     std::memset(resource_descriptors.mapped, 0,
                 static_cast<size_t>(resource_size));
     std::memset(sampler_descriptors.mapped, 0,
                 static_cast<size_t>(sampler_size));
     std::memset(storage_descriptors.mapped, 0,
                 static_cast<size_t>(storage_size));
+    std::memset(aux_value.mapped, 0, sizeof(uint32_t));
+    context.flush(aux_value);
 
     VkDescriptorImageInfo image_info{
         VK_NULL_HANDLE, image.view,
@@ -1511,6 +2007,23 @@ bool test_sampled_array_descriptor_buffer(
         properties.sampledImageDescriptorSize,
         static_cast<uint8_t*>(resource_descriptors.mapped) +
             resource_payload_offset);
+
+    if (vkd3d_aux_binding) {
+        VkDescriptorAddressInfoEXT aux_address{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+        aux_address.address = aux_value.address;
+        aux_address.range = sizeof(uint32_t);
+        aux_address.format = VK_FORMAT_UNDEFINED;
+        VkDescriptorGetInfoEXT aux_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+        aux_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        aux_info.data.pStorageBuffer = &aux_address;
+        context.get_descriptor(
+            context.device(), &aux_info,
+            properties.storageBufferDescriptorSize,
+            static_cast<uint8_t*>(resource_descriptors.mapped) +
+                base_offsets[0] + aux_binding_offset);
+    }
 
     VkDescriptorGetInfoEXT sampler_info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
@@ -1591,9 +2104,558 @@ bool test_sampled_array_descriptor_buffer(
          << " descriptor-buffer array count=" << descriptor_count
          << " index=" << descriptor_index
          << " variable=" << (variable_descriptor_count ? "yes" : "no")
+         << " aux-binding=" << (vkd3d_aux_binding ? "yes" : "no")
          << " set-offset=" << base_offsets[0];
     return report_result(name.str().c_str(), read_output(context, output),
                          kImageExpected);
+}
+
+bool test_sampler_array_descriptor_buffer(Context& context, Buffer& output,
+                                          const Image& image)
+{
+    constexpr uint32_t descriptor_count = 2048;
+    constexpr uint32_t descriptor_index = 1023;
+    const std::vector<VkDescriptorSetLayoutBinding> resource_bindings{{
+        0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr,
+    }};
+    const std::vector<VkDescriptorSetLayoutBinding> sampler_bindings{{
+        0, VK_DESCRIPTOR_TYPE_SAMPLER, descriptor_count,
+        VK_SHADER_STAGE_ALL, nullptr,
+    }};
+    const std::vector<VkDescriptorSetLayoutBinding> storage_bindings{{
+        0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr,
+    }};
+    std::vector<VkDescriptorSetLayout> layouts{
+        create_set_layout(context.device(), resource_bindings, true),
+        create_set_layout(context.device(), sampler_bindings, true),
+        create_set_layout(context.device(), storage_bindings, true),
+    };
+    DescriptorObjects objects = create_compute_objects(
+        context, std::move(layouts), descriptor_sampler_array_comp_spv,
+        sizeof(descriptor_sampler_array_comp_spv), true, sizeof(uint32_t));
+
+    const auto& properties = context.descriptor_properties();
+    const VkDeviceSize alignment =
+        properties.descriptorBufferOffsetAlignment;
+    std::array<VkDeviceSize, 3> layout_sizes{};
+    std::array<VkDeviceSize, 3> binding_offsets{};
+    for (size_t i = 0; i < objects.set_layouts.size(); ++i) {
+        context.get_layout_size(context.device(), objects.set_layouts[i],
+                                &layout_sizes[i]);
+        context.get_binding_offset(context.device(), objects.set_layouts[i],
+                                   0, &binding_offsets[i]);
+    }
+    const std::array<VkDeviceSize, 3> base_offsets{{
+        0, align_up(256, alignment), align_up(64, alignment),
+    }};
+    const VkDeviceSize resource_payload_offset =
+        base_offsets[0] + binding_offsets[0];
+    const VkDeviceSize sampler_payload_offset =
+        base_offsets[1] + binding_offsets[1] +
+        descriptor_index * properties.samplerDescriptorSize;
+    const VkDeviceSize storage_payload_offset =
+        base_offsets[2] + binding_offsets[2];
+
+    Buffer resource_descriptors = context.create_buffer(
+        align_up(std::max(base_offsets[0] + layout_sizes[0],
+                          resource_payload_offset +
+                              properties.sampledImageDescriptorSize),
+                 alignment),
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    Buffer sampler_descriptors = context.create_buffer(
+        align_up(std::max(base_offsets[1] + layout_sizes[1],
+                          sampler_payload_offset +
+                              properties.samplerDescriptorSize),
+                 alignment),
+        VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    Buffer storage_descriptors = context.create_buffer(
+        align_up(std::max(base_offsets[2] + layout_sizes[2],
+                          storage_payload_offset +
+                              properties.storageBufferDescriptorSize),
+                 alignment),
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    std::memset(resource_descriptors.mapped, 0,
+                static_cast<size_t>(resource_descriptors.size));
+    std::memset(sampler_descriptors.mapped, 0,
+                static_cast<size_t>(sampler_descriptors.size));
+    std::memset(storage_descriptors.mapped, 0,
+                static_cast<size_t>(storage_descriptors.size));
+
+    VkDescriptorImageInfo image_info{
+        VK_NULL_HANDLE, image.view,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorGetInfoEXT sampled_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    sampled_info.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    sampled_info.data.pSampledImage = &image_info;
+    context.get_descriptor(
+        context.device(), &sampled_info,
+        properties.sampledImageDescriptorSize,
+        static_cast<uint8_t*>(resource_descriptors.mapped) +
+            resource_payload_offset);
+
+    VkDescriptorGetInfoEXT sampler_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    sampler_info.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    sampler_info.data.pSampler = &image.sampler;
+    context.get_descriptor(
+        context.device(), &sampler_info,
+        properties.samplerDescriptorSize,
+        static_cast<uint8_t*>(sampler_descriptors.mapped) +
+            sampler_payload_offset);
+
+    VkDescriptorAddressInfoEXT output_address{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+    output_address.address = output.address;
+    output_address.range = sizeof(uint32_t);
+    output_address.format = VK_FORMAT_UNDEFINED;
+    VkDescriptorGetInfoEXT storage_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    storage_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    storage_info.data.pStorageBuffer = &output_address;
+    context.get_descriptor(
+        context.device(), &storage_info,
+        properties.storageBufferDescriptorSize,
+        static_cast<uint8_t*>(storage_descriptors.mapped) +
+            storage_payload_offset);
+    context.flush(resource_descriptors);
+    context.flush(sampler_descriptors);
+    context.flush(storage_descriptors);
+
+    reset_output(context, output);
+    context.submit([&](VkCommandBuffer command_buffer) {
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          objects.pipeline);
+        const std::array<VkDescriptorBufferBindingInfoEXT, 3> bindings{{
+            {VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, nullptr,
+             resource_descriptors.address,
+             VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT},
+            {VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, nullptr,
+             sampler_descriptors.address,
+             VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT},
+            {VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, nullptr,
+             storage_descriptors.address,
+             VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT},
+        }};
+        context.cmd_bind_descriptor_buffers(
+            command_buffer, static_cast<uint32_t>(bindings.size()),
+            bindings.data());
+        const std::array<uint32_t, 3> buffer_indices{{0, 1, 2}};
+        context.cmd_set_descriptor_offsets(
+            command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            objects.pipeline_layout, 0,
+            static_cast<uint32_t>(buffer_indices.size()),
+            buffer_indices.data(), base_offsets.data());
+        vkCmdPushConstants(command_buffer, objects.pipeline_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(descriptor_index), &descriptor_index);
+        vkCmdDispatch(command_buffer, 1, 1, 1);
+        add_compute_to_host_barrier(command_buffer, output.buffer);
+    });
+    return report_result(
+        "fixed-count runtime sampler descriptor-buffer array",
+        read_output(context, output), kImageExpected);
+}
+
+bool test_graphics_descriptor_buffer(
+    Context& context, Buffer& output, const Image& image,
+    bool mutable_descriptor)
+{
+    constexpr uint32_t descriptor_count = 1000000;
+    constexpr uint32_t descriptor_index = 524287;
+    Image render_target = context.create_render_target();
+    const std::vector<VkDescriptorSetLayoutBinding> sampler_bindings{{
+        0, VK_DESCRIPTOR_TYPE_SAMPLER, 1,
+        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr,
+    }};
+    std::vector<VkDescriptorSetLayout> layouts{
+        create_sampled_array_layout(context, true, mutable_descriptor,
+                                    descriptor_count, false, true),
+        create_set_layout(context.device(), sampler_bindings, true),
+    };
+    DescriptorObjects objects = create_graphics_objects(
+        context, std::move(layouts), render_target);
+
+    const auto& properties = context.descriptor_properties();
+    const VkDeviceSize alignment =
+        properties.descriptorBufferOffsetAlignment;
+    VkDeviceSize resource_layout_size = 0;
+    VkDeviceSize resource_array_offset = 0;
+    VkDeviceSize aux_offset = 0;
+    VkDeviceSize sampler_layout_size = 0;
+    VkDeviceSize sampler_offset = 0;
+    context.get_layout_size(context.device(), objects.set_layouts[0],
+                            &resource_layout_size);
+    context.get_binding_offset(context.device(), objects.set_layouts[0], 0,
+                               &aux_offset);
+    context.get_binding_offset(context.device(), objects.set_layouts[0], 1,
+                               &resource_array_offset);
+    context.get_layout_size(context.device(), objects.set_layouts[1],
+                            &sampler_layout_size);
+    context.get_binding_offset(context.device(), objects.set_layouts[1], 0,
+                               &sampler_offset);
+
+    const VkDeviceSize resource_base = align_up(256, alignment);
+    const VkDeviceSize sampler_base = align_up(128, alignment);
+    const size_t descriptor_stride = mutable_descriptor
+        ? mutable_descriptor_stride(properties)
+        : properties.sampledImageDescriptorSize;
+    const VkDeviceSize resource_payload_offset =
+        resource_base + resource_array_offset +
+        descriptor_index * descriptor_stride;
+    const VkDeviceSize sampler_payload_offset =
+        sampler_base + sampler_offset;
+    const VkDeviceSize resource_size = align_up(
+        std::max(resource_base + resource_layout_size,
+                 resource_payload_offset +
+                     properties.sampledImageDescriptorSize),
+        alignment);
+    const VkDeviceSize sampler_size = align_up(
+        std::max(sampler_base + sampler_layout_size,
+                 sampler_payload_offset +
+                     properties.samplerDescriptorSize),
+        alignment);
+
+    Buffer resource_descriptors = context.create_buffer(
+        resource_size,
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    Buffer sampler_descriptors = context.create_buffer(
+        sampler_size,
+        VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    Buffer aux_value = context.create_buffer(
+        sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    std::memset(resource_descriptors.mapped, 0,
+                static_cast<size_t>(resource_size));
+    std::memset(sampler_descriptors.mapped, 0,
+                static_cast<size_t>(sampler_size));
+    std::memset(aux_value.mapped, 0, sizeof(uint32_t));
+
+    VkDescriptorAddressInfoEXT aux_address{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+    aux_address.address = aux_value.address;
+    aux_address.range = sizeof(uint32_t);
+    aux_address.format = VK_FORMAT_UNDEFINED;
+    VkDescriptorGetInfoEXT aux_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    aux_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    aux_info.data.pStorageBuffer = &aux_address;
+    context.get_descriptor(
+        context.device(), &aux_info,
+        properties.storageBufferDescriptorSize,
+        static_cast<uint8_t*>(resource_descriptors.mapped) +
+            resource_base + aux_offset);
+
+    VkDescriptorImageInfo image_info{
+        VK_NULL_HANDLE, image.view,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorGetInfoEXT sampled_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    sampled_info.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    sampled_info.data.pSampledImage = &image_info;
+    context.get_descriptor(
+        context.device(), &sampled_info,
+        properties.sampledImageDescriptorSize,
+        static_cast<uint8_t*>(resource_descriptors.mapped) +
+            resource_payload_offset);
+
+    VkDescriptorGetInfoEXT sampler_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    sampler_info.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    sampler_info.data.pSampler = &image.sampler;
+    context.get_descriptor(
+        context.device(), &sampler_info,
+        properties.samplerDescriptorSize,
+        static_cast<uint8_t*>(sampler_descriptors.mapped) +
+            sampler_payload_offset);
+    context.flush(aux_value);
+    context.flush(resource_descriptors);
+    context.flush(sampler_descriptors);
+    reset_output(context, output);
+
+    context.submit([&](VkCommandBuffer command_buffer) {
+        const VkClearValue clear{{{0.0f, 0.0f, 0.0f, 0.0f}}};
+        VkRenderPassBeginInfo begin{
+            VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        begin.renderPass = objects.render_pass;
+        begin.framebuffer = objects.framebuffer;
+        begin.renderArea.extent = {1, 1};
+        begin.clearValueCount = 1;
+        begin.pClearValues = &clear;
+        vkCmdBeginRenderPass(command_buffer, &begin,
+                             VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          objects.pipeline);
+        const std::array<VkDescriptorBufferBindingInfoEXT, 2> bindings{{
+            {VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, nullptr,
+             resource_descriptors.address,
+             VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT},
+            {VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, nullptr,
+             sampler_descriptors.address,
+             VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT},
+        }};
+        context.cmd_bind_descriptor_buffers(
+            command_buffer, static_cast<uint32_t>(bindings.size()),
+            bindings.data());
+        const std::array<uint32_t, 2> buffer_indices{{0, 1}};
+        const std::array<VkDeviceSize, 2> offsets{{
+            resource_base, sampler_base,
+        }};
+        context.cmd_set_descriptor_offsets(
+            command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            objects.pipeline_layout, 0,
+            static_cast<uint32_t>(buffer_indices.size()),
+            buffer_indices.data(), offsets.data());
+        vkCmdPushConstants(command_buffer, objects.pipeline_layout,
+                           VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(descriptor_index), &descriptor_index);
+        vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        vkCmdEndRenderPass(command_buffer);
+
+        VkImageMemoryBarrier image_barrier{
+            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        image_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        image_barrier.image = render_target.image;
+        image_barrier.subresourceRange.aspectMask =
+            VK_IMAGE_ASPECT_COLOR_BIT;
+        image_barrier.subresourceRange.levelCount = 1;
+        image_barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(
+            command_buffer,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            0, nullptr, 0, nullptr, 1, &image_barrier);
+
+        VkBufferImageCopy copy{};
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = {1, 1, 1};
+        vkCmdCopyImageToBuffer(
+            command_buffer, render_target.image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output.buffer, 1, &copy);
+
+        VkBufferMemoryBarrier output_barrier{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        output_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        output_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.buffer = output.buffer;
+        output_barrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(command_buffer,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, nullptr, 1, &output_barrier, 0, nullptr);
+    });
+
+    return report_result(
+        mutable_descriptor
+            ? "fragment-stage mutable descriptor-buffer array"
+            : "fragment-stage typed descriptor-buffer array",
+        read_output(context, output), kImageExpected);
+}
+
+bool test_graphics_texel_descriptor_buffer(
+    Context& context, Buffer& output, bool mutable_descriptor)
+{
+    constexpr uint32_t descriptor_count = 1000000;
+    constexpr std::array<uint32_t, 2> descriptor_indices{{
+        524287, 524288,
+    }};
+    constexpr float float_value = 0.25f;
+
+    Image render_target = context.create_render_target();
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    if (mutable_descriptor) {
+        layout = create_sampled_array_layout(
+            context, true, true, descriptor_count, false, false);
+    } else {
+        const std::vector<VkDescriptorSetLayoutBinding> bindings{{
+            0, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, descriptor_count,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            nullptr,
+        }};
+        layout = create_set_layout(context.device(), bindings, true);
+    }
+    DescriptorObjects objects = create_graphics_objects(
+        context, {layout}, render_target,
+        descriptor_texel_graphics_vert_spv,
+        sizeof(descriptor_texel_graphics_vert_spv),
+        descriptor_texel_graphics_frag_spv,
+        sizeof(descriptor_texel_graphics_frag_spv),
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        sizeof(descriptor_indices));
+
+    const auto& properties = context.descriptor_properties();
+    const VkDeviceSize alignment =
+        properties.descriptorBufferOffsetAlignment;
+    VkDeviceSize layout_size = 0;
+    VkDeviceSize binding_offset = 0;
+    context.get_layout_size(context.device(), objects.set_layouts[0],
+                            &layout_size);
+    context.get_binding_offset(context.device(), objects.set_layouts[0], 0,
+                               &binding_offset);
+
+    const VkDeviceSize base_offset = align_up(256, alignment);
+    const VkDeviceSize descriptor_stride = mutable_descriptor
+        ? mutable_descriptor_stride(properties)
+        : properties.uniformTexelBufferDescriptorSize;
+    const VkDeviceSize uint_descriptor_offset =
+        base_offset + binding_offset +
+        descriptor_indices[0] * descriptor_stride;
+    const VkDeviceSize float_descriptor_offset =
+        base_offset + binding_offset +
+        descriptor_indices[1] * descriptor_stride;
+    const VkDeviceSize descriptor_size = mutable_descriptor
+        ? properties.robustUniformTexelBufferDescriptorSize
+        : properties.uniformTexelBufferDescriptorSize;
+    const VkDeviceSize allocation_size = align_up(
+        std::max(base_offset + layout_size,
+                 float_descriptor_offset + descriptor_size),
+        alignment);
+
+    Buffer descriptors = context.create_buffer(
+        allocation_size,
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    Buffer texels = context.create_buffer(
+        2 * sizeof(uint32_t),
+        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    std::memset(descriptors.mapped, 0,
+                static_cast<size_t>(descriptors.size));
+    std::memcpy(texels.mapped, &kImageExpected, sizeof(kImageExpected));
+    std::memcpy(static_cast<uint8_t*>(texels.mapped) + sizeof(uint32_t),
+                &float_value, sizeof(float_value));
+
+    VkDescriptorAddressInfoEXT uint_address{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+    uint_address.address = texels.address;
+    uint_address.range = sizeof(uint32_t);
+    uint_address.format = VK_FORMAT_R32_UINT;
+    VkDescriptorGetInfoEXT uint_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    uint_info.type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    uint_info.data.pUniformTexelBuffer = &uint_address;
+    context.get_descriptor(
+        context.device(), &uint_info, descriptor_size,
+        static_cast<uint8_t*>(descriptors.mapped) +
+            uint_descriptor_offset);
+
+    VkDescriptorAddressInfoEXT float_address{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+    float_address.address = texels.address + sizeof(uint32_t);
+    float_address.range = sizeof(uint32_t);
+    float_address.format = VK_FORMAT_R32_SFLOAT;
+    VkDescriptorGetInfoEXT float_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+    float_info.type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    float_info.data.pUniformTexelBuffer = &float_address;
+    context.get_descriptor(
+        context.device(), &float_info, descriptor_size,
+        static_cast<uint8_t*>(descriptors.mapped) +
+            float_descriptor_offset);
+    context.flush(texels);
+    context.flush(descriptors);
+    reset_output(context, output);
+
+    context.submit([&](VkCommandBuffer command_buffer) {
+        const VkClearValue clear{{{0.0f, 0.0f, 0.0f, 0.0f}}};
+        VkRenderPassBeginInfo begin{
+            VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        begin.renderPass = objects.render_pass;
+        begin.framebuffer = objects.framebuffer;
+        begin.renderArea.extent = {1, 1};
+        begin.clearValueCount = 1;
+        begin.pClearValues = &clear;
+        vkCmdBeginRenderPass(command_buffer, &begin,
+                             VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          objects.pipeline);
+        VkDescriptorBufferBindingInfoEXT binding{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT};
+        binding.address = descriptors.address;
+        binding.usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
+        context.cmd_bind_descriptor_buffers(command_buffer, 1, &binding);
+        const uint32_t buffer_index = 0;
+        context.cmd_set_descriptor_offsets(
+            command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            objects.pipeline_layout, 0, 1, &buffer_index, &base_offset);
+        vkCmdPushConstants(
+            command_buffer, objects.pipeline_layout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(descriptor_indices), descriptor_indices.data());
+        vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        vkCmdEndRenderPass(command_buffer);
+
+        VkImageMemoryBarrier image_barrier{
+            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        image_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        image_barrier.image = render_target.image;
+        image_barrier.subresourceRange.aspectMask =
+            VK_IMAGE_ASPECT_COLOR_BIT;
+        image_barrier.subresourceRange.levelCount = 1;
+        image_barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(
+            command_buffer,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            0, nullptr, 0, nullptr, 1, &image_barrier);
+
+        VkBufferImageCopy copy{};
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = {1, 1, 1};
+        vkCmdCopyImageToBuffer(
+            command_buffer, render_target.image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output.buffer, 1, &copy);
+
+        VkBufferMemoryBarrier output_barrier{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        output_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        output_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.buffer = output.buffer;
+        output_barrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(command_buffer,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, nullptr, 1, &output_barrier, 0, nullptr);
+    });
+
+    return report_result(
+        mutable_descriptor
+            ? "graphics mutable texel descriptor-buffer aliases"
+            : "graphics typed texel descriptor-buffer aliases",
+        read_output(context, output), kImageExpected);
 }
 
 } // namespace
@@ -1605,15 +2667,29 @@ int main()
         Buffer output = context.create_buffer(
             sizeof(uint32_t),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
         Image image = context.create_test_image();
 
         bool passed = true;
         passed &= test_storage_descriptor_set(context, output);
         passed &= test_storage_descriptor_buffer(context, output);
+        passed &= test_uniform_buffer(context, output, false);
+        passed &= test_uniform_buffer(context, output, true);
+        passed &= test_descriptor_buffer_push_descriptor(context, output);
         passed &= test_image_descriptor_set(context, output, image);
         passed &= test_image_descriptor_buffer(context, output, image);
+        passed &= test_sampler_array_descriptor_buffer(
+            context, output, image);
+        passed &= test_graphics_descriptor_buffer(
+            context, output, image, false);
+        passed &= test_graphics_descriptor_buffer(
+            context, output, image, true);
+        passed &= test_graphics_texel_descriptor_buffer(
+            context, output, false);
+        passed &= test_graphics_texel_descriptor_buffer(
+            context, output, true);
         passed &= test_mutable_descriptor_set(context, output, image);
         passed &= test_sampled_array_descriptor_buffer(
             context, output, image, false, 4, 3, 0,
@@ -1675,6 +2751,66 @@ int main()
             descriptor_mutable_comp_spv,
             sizeof(descriptor_mutable_comp_spv),
             "nonuniform-index");
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, false, 1, 0, 0,
+            descriptor_uniform_array_comp_spv,
+            sizeof(descriptor_uniform_array_comp_spv),
+            "uniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, false, 1024, 511, 256,
+            descriptor_uniform_array_comp_spv,
+            sizeof(descriptor_uniform_array_comp_spv),
+            "uniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, true, 1, 0, 0,
+            descriptor_uniform_array_comp_spv,
+            sizeof(descriptor_uniform_array_comp_spv),
+            "uniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, true, 1024, 511, 256,
+            descriptor_uniform_array_comp_spv,
+            sizeof(descriptor_uniform_array_comp_spv),
+            "uniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, false, 1, 0, 0,
+            descriptor_mutable_comp_spv,
+            sizeof(descriptor_mutable_comp_spv),
+            "nonuniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, false, 1024, 511, 256,
+            descriptor_mutable_comp_spv,
+            sizeof(descriptor_mutable_comp_spv),
+            "nonuniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, true, 1, 0, 0,
+            descriptor_mutable_comp_spv,
+            sizeof(descriptor_mutable_comp_spv),
+            "nonuniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, true, 1024, 511, 256,
+            descriptor_mutable_comp_spv,
+            sizeof(descriptor_mutable_comp_spv),
+            "nonuniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, false, 1000000, 524287, 256,
+            descriptor_mutable_comp_spv,
+            sizeof(descriptor_mutable_comp_spv),
+            "vkd3d-sized-nonuniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, true, 1000000, 524287, 256,
+            descriptor_mutable_comp_spv,
+            sizeof(descriptor_mutable_comp_spv),
+            "vkd3d-sized-nonuniform-runtime-index", false);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, true, 1024, 511, 256,
+            descriptor_vkd3d_array_comp_spv,
+            sizeof(descriptor_vkd3d_array_comp_spv),
+            "vkd3d-layout-nonuniform-runtime-index", false, true);
+        passed &= test_sampled_array_descriptor_buffer(
+            context, output, image, true, 1000000, 524287, 256,
+            descriptor_vkd3d_array_comp_spv,
+            sizeof(descriptor_vkd3d_array_comp_spv),
+            "vkd3d-layout-sized-nonuniform-runtime-index", false, true);
 
         std::cout << (passed ? "OVERALL: PASS" : "OVERALL: FAIL") << '\n';
         return passed ? 0 : 1;

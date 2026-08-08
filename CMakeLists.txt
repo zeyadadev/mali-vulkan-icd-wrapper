@@ -572,6 +572,20 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
             ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_uniform_array_comp_spv.hpp)
         set(DESCRIPTOR_FIXED_ARRAY_SHADER_HEADER
             ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_fixed_array_comp_spv.hpp)
+        set(DESCRIPTOR_UNIFORM_BUFFER_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_uniform_buffer_comp_spv.hpp)
+        set(DESCRIPTOR_SAMPLER_ARRAY_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_sampler_array_comp_spv.hpp)
+        set(DESCRIPTOR_VKD3D_ARRAY_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_vkd3d_array_comp_spv.hpp)
+        set(DESCRIPTOR_GRAPHICS_VERTEX_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_graphics_vert_spv.hpp)
+        set(DESCRIPTOR_GRAPHICS_FRAGMENT_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_graphics_frag_spv.hpp)
+        set(DESCRIPTOR_TEXEL_GRAPHICS_VERTEX_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_texel_graphics_vert_spv.hpp)
+        set(DESCRIPTOR_TEXEL_GRAPHICS_FRAGMENT_SHADER_HEADER
+            ${DESCRIPTOR_TEST_GENERATED_DIR}/descriptor_texel_graphics_frag_spv.hpp)
 
         add_custom_command(
             OUTPUT ${DESCRIPTOR_STORAGE_SHADER_HEADER}
@@ -638,6 +652,97 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_fixed_array.comp
             VERBATIM
         )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_UNIFORM_BUFFER_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_uniform_buffer_comp_spv
+                    -o ${DESCRIPTOR_UNIFORM_BUFFER_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_uniform_buffer.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_uniform_buffer.comp
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_SAMPLER_ARRAY_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_sampler_array_comp_spv
+                    -o ${DESCRIPTOR_SAMPLER_ARRAY_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_sampler_array.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_sampler_array.comp
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_VKD3D_ARRAY_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_vkd3d_array_comp_spv
+                    -o ${DESCRIPTOR_VKD3D_ARRAY_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_vkd3d_array.comp
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_vkd3d_array.comp
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_GRAPHICS_VERTEX_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_graphics_vert_spv
+                    -o ${DESCRIPTOR_GRAPHICS_VERTEX_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_graphics.vert
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_graphics.vert
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_GRAPHICS_FRAGMENT_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_graphics_frag_spv
+                    -o ${DESCRIPTOR_GRAPHICS_FRAGMENT_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_graphics.frag
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_graphics.frag
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_TEXEL_GRAPHICS_VERTEX_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_texel_graphics_vert_spv
+                    -o ${DESCRIPTOR_TEXEL_GRAPHICS_VERTEX_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_texel_graphics.vert
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_texel_graphics.vert
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT ${DESCRIPTOR_TEXEL_GRAPHICS_FRAGMENT_SHADER_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${DESCRIPTOR_TEST_GENERATED_DIR}
+            COMMAND ${DESCRIPTOR_TEST_GLSLANG_VALIDATOR}
+                    -V --target-env vulkan1.2
+                    --vn descriptor_texel_graphics_frag_spv
+                    -o ${DESCRIPTOR_TEXEL_GRAPHICS_FRAGMENT_SHADER_HEADER}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_texel_graphics.frag
+            DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/descriptor_texel_graphics.frag
+            VERBATIM
+        )
 
         add_executable(mali_descriptor_buffer_gpu_test
             tests/descriptor_buffer_gpu_test.cpp
@@ -646,6 +751,13 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
             ${DESCRIPTOR_MUTABLE_SHADER_HEADER}
             ${DESCRIPTOR_UNIFORM_ARRAY_SHADER_HEADER}
             ${DESCRIPTOR_FIXED_ARRAY_SHADER_HEADER}
+            ${DESCRIPTOR_UNIFORM_BUFFER_SHADER_HEADER}
+            ${DESCRIPTOR_SAMPLER_ARRAY_SHADER_HEADER}
+            ${DESCRIPTOR_VKD3D_ARRAY_SHADER_HEADER}
+            ${DESCRIPTOR_GRAPHICS_VERTEX_SHADER_HEADER}
+            ${DESCRIPTOR_GRAPHICS_FRAGMENT_SHADER_HEADER}
+            ${DESCRIPTOR_TEXEL_GRAPHICS_VERTEX_SHADER_HEADER}
+            ${DESCRIPTOR_TEXEL_GRAPHICS_FRAGMENT_SHADER_HEADER}
         )
         target_include_directories(mali_descriptor_buffer_gpu_test PRIVATE
             ${DESCRIPTOR_TEST_GENERATED_DIR}
