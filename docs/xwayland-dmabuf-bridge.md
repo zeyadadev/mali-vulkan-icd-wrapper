@@ -148,7 +148,7 @@ Timer pacing is disabled when `XWL_DMABUF_BRIDGE_MAX_FPS` is unset or `0`.
 Feedback is probed even in non-blocking mode; per-frame waits happen only when
 explicitly enabled and supported by the patched server.
 
-`XWL_DMABUF_BRIDGE_ALLOW_MAILBOX` is a deprecated bridge-only alias for
+`XWL_DMABUF_BRIDGE_ALLOW_MAILBOX` remains a deprecated compatibility alias for
 `WSI_ALLOW_NON_FIFO_PRESENT_MODE=1`.
 
 ## Troubleshooting

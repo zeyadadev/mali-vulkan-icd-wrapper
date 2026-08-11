@@ -74,9 +74,10 @@ WSI_X11_DRI3_COPY=1 your-game
 
 ## Present modes
 
-The DRI3 and bridge paths force requested MAILBOX or IMMEDIATE presentation
-back to FIFO by default. FIFO uses Present MSC pacing and is the stable choice
-on the patched Xwayland/Mali combination.
+The wrapper forces requested MAILBOX, IMMEDIATE, or FIFO_RELAXED presentation
+back to FIFO by default on every wrapper-owned swapchain. On X11, FIFO uses
+Present MSC pacing and is the stable choice on the patched Xwayland/Mali
+combination.
 
 Keep the application's non-FIFO request with:
 
@@ -85,8 +86,8 @@ WSI_ALLOW_NON_FIFO_PRESENT_MODE=1 your-game
 ```
 
 This is an opt-in tradeoff and can flicker. The older
-`XWL_DMABUF_BRIDGE_ALLOW_MAILBOX` variable still works on the bridge path but
-is deprecated.
+`XWL_DMABUF_BRIDGE_ALLOW_MAILBOX` variable remains a deprecated compatibility
+alias.
 
 ## Legacy bridge
 

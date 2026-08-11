@@ -29,6 +29,7 @@
  */
 
 #include <cassert>
+#include <cstdlib>
 #include <new>
 #include <atomic>
 
@@ -41,6 +42,37 @@
 #include <wsi/wsi_factory.hpp>
 #include <wsi/extensions/frame_boundary.hpp>
 #include "layer_utils/macros.hpp"
+
+namespace
+{
+
+bool env_var_is_enabled(const char *value)
+{
+   return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+bool allow_non_fifo_present_mode()
+{
+   if (env_var_is_enabled(std::getenv("WSI_ALLOW_NON_FIFO_PRESENT_MODE")))
+   {
+      return true;
+   }
+
+   if (env_var_is_enabled(std::getenv("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX")))
+   {
+      static std::atomic<bool> warned_legacy_mailbox_env{ false };
+      bool expected = false;
+      if (warned_legacy_mailbox_env.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+      {
+         WSI_LOG_WARNING("XWL_DMABUF_BRIDGE_ALLOW_MAILBOX is deprecated; use WSI_ALLOW_NON_FIFO_PRESENT_MODE=1.");
+      }
+      return true;
+   }
+
+   return false;
+}
+
+} // namespace
 
 VWL_VKAPI_CALL(VkResult) __attribute__((visibility("default")))
 wsi_layer_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pSwapchainCreateInfo,
@@ -90,6 +122,14 @@ wsi_layer_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *
    }
 
    VkSwapchainCreateInfoKHR my_create_info = *pSwapchainCreateInfo;
+   if (!allow_non_fifo_present_mode() && my_create_info.presentMode != VK_PRESENT_MODE_FIFO_KHR)
+   {
+      WSI_LOG_WARNING(
+         "Forcing requested present mode %d to FIFO for compatibility "
+         "(set WSI_ALLOW_NON_FIFO_PRESENT_MODE=1 to keep the app-selected mode).",
+         static_cast<int>(my_create_info.presentMode));
+      my_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+   }
    VkResult init_result = sc->init(device_data.device, &my_create_info);
    WSI_LOG_DEBUG("swapchain init result %d", init_result);
    if (init_result != VK_SUCCESS)
