@@ -42,8 +42,8 @@ The defaults come directly from `scripts/mali/install_mali_blobs.sh`:
 | `MALI_G29_CLEAN_EXTRACT` | Clean the selected extraction directory first |
 | `MALI_DOWNLOAD_DIR` | `/tmp/mali-wrapper-blobs` |
 
-The `latest` g29p1 choice selects the v1.10 package currently encoded in the
-script. A custom package URL can be supplied through
+The `latest` g29p1 choice selects the `v1.10-1-334a20c` package currently
+encoded in the script. A custom package URL can be supplied through
 `MALI_G29_64_DEB_URL`.
 
 Useful unattended runs:
